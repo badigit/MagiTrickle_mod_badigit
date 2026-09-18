@@ -23,3 +23,10 @@ tools/reconnect-debug/watchdog.conf
 
 # Локальные адреса роутеров (см. .router.env.example) — не коммитить
 /.router.env
+
+# Сгенерированные .d.ts конфигов сборки фронта.
+src/frontend/*.config.d.ts
+
+# Собранный бинарь бенча: 7.3 МБ под Windows, пересобирается `go build` из
+# соседнего main.go. Репозиторий публичный — бинарники в нём никому не нужны.
+tools/dns-bench/dns-bench.exe
