@@ -9,6 +9,7 @@ import (
 	"sync/atomic"
 
 	"github.com/vishvananda/netlink"
+	"github.com/vishvananda/netlink/nl"
 	"golang.org/x/sys/unix"
 )
 
@@ -135,7 +136,7 @@ func (r *IPSet) DelIPv4Subnet(subnet IPv4Subnet) error {
 		IP:   subnet.Address[:],
 		CIDR: subnet.CIDR,
 	})
-	if err != nil {
+	if err != nil && !errors.Is(err, nl.IPSetError(nl.IPSET_ERR_EXIST)) {
 		return fmt.Errorf("failed to delete address: %w", err)
 	}
 
@@ -154,7 +155,7 @@ func (r *IPSet) DelIPv6Subnet(subnet IPv6Subnet) error {
 		IP:   subnet.Address[:],
 		CIDR: subnet.CIDR,
 	})
-	if err != nil {
+	if err != nil && !errors.Is(err, nl.IPSetError(nl.IPSET_ERR_EXIST)) {
 		return fmt.Errorf("failed to delete address: %w", err)
 	}
 

@@ -339,7 +339,7 @@ func (r *IPSetToLink) deleteIPRule() error {
 
 	if r.ip4Rule != nil {
 		err := netlink.RuleDel(r.ip4Rule)
-		if err != nil {
+		if err != nil && !errors.Is(err, unix.ENOENT) {
 			errs = append(errs, fmt.Errorf("error while deleting rule: %w", err))
 		}
 		r.ip4Rule = nil
@@ -347,7 +347,7 @@ func (r *IPSetToLink) deleteIPRule() error {
 
 	if r.ip6Rule != nil {
 		err := netlink.RuleDel(r.ip6Rule)
-		if err != nil {
+		if err != nil && !errors.Is(err, unix.ENOENT) {
 			errs = append(errs, fmt.Errorf("error while deleting rule: %w", err))
 		}
 		r.ip6Rule = nil
@@ -466,7 +466,7 @@ func (r *IPSetToLink) updateIfaceRoute(iface netlink.Link, family int, current *
 			return current, nil
 		}
 		if route.Gw != nil {
-			if err := netlink.RouteDel(current); err != nil {
+			if err := netlink.RouteDel(current); err != nil && !errors.Is(err, unix.ESRCH) && !errors.Is(err, unix.ENOENT) {
 				return current, fmt.Errorf("error deleting iface route: %w", err)
 			}
 		}
@@ -499,13 +499,14 @@ func getGwFromIface(iface netlink.Link, family int) (net.IP, error) {
 
 func (r *IPSetToLink) deleteIPRoute() error {
 	errs := make([]error, 0)
+	// Missing routes report ESRCH for IPv4 and may report ENOENT for IPv6.
 
 	for i := 1; i >= 0; i-- {
 		if r.ip4Route[i] == nil {
 			continue
 		}
 		err := netlink.RouteDel(r.ip4Route[i])
-		if err != nil {
+		if err != nil && !errors.Is(err, unix.ESRCH) && !errors.Is(err, unix.ENOENT) {
 			errs = append(errs, fmt.Errorf("error while deleting route: %w", err))
 		}
 		r.ip4Route[i] = nil
@@ -516,7 +517,7 @@ func (r *IPSetToLink) deleteIPRoute() error {
 			continue
 		}
 		err := netlink.RouteDel(r.ip6Route[i])
-		if err != nil {
+		if err != nil && !errors.Is(err, unix.ESRCH) && !errors.Is(err, unix.ENOENT) {
 			errs = append(errs, fmt.Errorf("error while deleting route: %w", err))
 		}
 		r.ip6Route[i] = nil
