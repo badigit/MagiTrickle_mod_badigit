@@ -499,7 +499,7 @@ func getGwFromIface(iface netlink.Link, family int) (net.IP, error) {
 
 func (r *IPSetToLink) deleteIPRoute() error {
 	errs := make([]error, 0)
-	// Missing routes report ESRCH for IPv4 and may report ENOENT for IPv6.
+	// Missing routes report ESRCH; IPv6 default routes with metric 0 can report ENOENT.
 
 	for i := 1; i >= 0; i-- {
 		if r.ip4Route[i] == nil {

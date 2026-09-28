@@ -249,7 +249,7 @@ func (r *IPSetToTProxy) deleteIPRule() error {
 
 	if r.ip4Rule != nil {
 		err := netlink.RuleDel(r.ip4Rule)
-		if err != nil {
+		if err != nil && !errors.Is(err, unix.ENOENT) {
 			errs = append(errs, fmt.Errorf("error while deleting rule: %w", err))
 		}
 		r.ip4Rule = nil
@@ -257,7 +257,7 @@ func (r *IPSetToTProxy) deleteIPRule() error {
 
 	if r.ip6Rule != nil {
 		err := netlink.RuleDel(r.ip6Rule)
-		if err != nil {
+		if err != nil && !errors.Is(err, unix.ENOENT) {
 			errs = append(errs, fmt.Errorf("error while deleting rule: %w", err))
 		}
 		r.ip6Rule = nil
@@ -312,7 +312,7 @@ func (r *IPSetToTProxy) deleteIPRoute() error {
 
 	if r.ip4Route != nil {
 		err := netlink.RouteDel(r.ip4Route)
-		if err != nil {
+		if err != nil && !errors.Is(err, unix.ESRCH) && !errors.Is(err, unix.ENOENT) {
 			errs = append(errs, fmt.Errorf("error while deleting route: %w", err))
 		}
 		r.ip4Route = nil
@@ -320,7 +320,7 @@ func (r *IPSetToTProxy) deleteIPRoute() error {
 
 	if r.ip6Route != nil {
 		err := netlink.RouteDel(r.ip6Route)
-		if err != nil {
+		if err != nil && !errors.Is(err, unix.ESRCH) && !errors.Is(err, unix.ENOENT) {
 			errs = append(errs, fmt.Errorf("error while deleting route: %w", err))
 		}
 		r.ip6Route = nil
