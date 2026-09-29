@@ -705,8 +705,9 @@ func (a *App) applyDirectPriority(mode string, ensureRouting bool) error {
 	if !ensureRouting {
 		return nil
 	}
-	// cfgMu к этому моменту отпущен — под routingMutationMu его брать нельзя.
-	return a.WithRoutingMutation(func() error {
+	// cfgMu к этому моменту отпущен: запись режима шла под Lock, а пересоздание
+	// цепочек идёт под RLock — RWMutex в Go не повышается и не понижается.
+	return a.withRoutingMutationUnderConfig(func() error {
 		if a.routingActive.Load() {
 			if err := a.bringDown(); err != nil {
 				return fmt.Errorf("teardown: %w", err)
@@ -734,6 +735,25 @@ func (a *App) WithRoutingMutation(fn func() error) error {
 	a.routingMutationMu.Lock()
 	defer a.routingMutationMu.Unlock()
 	return fn()
+}
+
+// withRoutingMutationUnderConfig — тот же WithRoutingMutation, но с взятым снаружи
+// cfgMu.RLock. Нужен всем жизненным циклам роутинга (SetEnabled, Start,
+// смена directPriority): подъём и снятие читают конфиг-модель — g.Rules в
+// Group.Sync и RebuildTrie, g.Group.Enable и g.Interface в Group.enable/disable, —
+// а API-писатели мутируют их in-place под cfgMu.Lock. Без этого лока
+// одновременные enable/disable и правка правил (HTTP или SIGHUP) дают Sync
+// полуизменённый набор правил, и нужные ipset-записи временно удаляются
+// (mt-03q).
+//
+// Порядок локов здесь «lifecycleMu -> cfgMu -> routingMutationMu» и совпадает с
+// тем, по которому идёт автообновление подписок («cfgMu -> routingMutationMu»),
+// поэтому инверсии нет. Внутри fn cfgMu брать нельзя по-прежнему:
+// рекурсивный RLock при ждущем писателе в Go — дедлок.
+func (a *App) withRoutingMutationUnderConfig(fn func() error) error {
+	a.cfgMu.RLock()
+	defer a.cfgMu.RUnlock()
+	return a.WithRoutingMutation(fn)
 }
 
 func (a *App) bringUp() error {
@@ -839,13 +859,16 @@ func (a *App) SetEnabled(enabled bool) error {
 		return errors.New("daemon is shutting down")
 	}
 
-	if a.config.Enabled == enabled && a.routingActive.Load() == enabled {
+	// Чтение config.Enabled — под cfgMu: его меняет и SIGHUP-reload, и этот же
+	// метод ниже. lifecycleMu сериализует только SetEnabled между собой и
+	// от писателей конфига не защищает (mt-03q).
+	if a.routingIntended() == enabled && a.routingActive.Load() == enabled {
 		return nil
 	}
 
 	var bringDownErr error
 	if enabled {
-		if err := a.WithRoutingMutation(a.bringUpRouting); err != nil {
+		if err := a.withRoutingMutationUnderConfig(a.bringUp); err != nil {
 			return err
 		}
 		if a.committer != nil {
@@ -858,7 +881,7 @@ func (a *App) SetEnabled(enabled bool) error {
 			// начнётся. Иначе он восстановил бы то, что снимает teardown.
 			a.committer.setMode(committerPaused)
 		}
-		bringDownErr = a.WithRoutingMutation(a.bringDownRouting)
+		bringDownErr = a.withRoutingMutationUnderConfig(a.bringDown)
 	}
 
 	// Намерение пользователя фиксируется в конфиге безусловно, даже если
@@ -868,8 +891,11 @@ func (a *App) SetEnabled(enabled bool) error {
 	// Ошибка снятия при этом не глотается: она возвращается вызывающему
 	// вместе с возможной ошибкой SaveConfig, чтобы HTTP-обработчик не
 	// ответил 200 OK при частично снятых iptables-цепочках.
-	a.config.Enabled = enabled
-	saveErr := a.SaveConfig()
+	// Запись — под эксклюзивным cfgMu, и только после выхода из секции с RLock
+	// выше: RWMutex в Go не повышается. SaveConfig берёт RLock сам — зовём его
+	// снаружи лока.
+	a.WithConfigWrite(func() { a.config.Enabled = enabled })
+	saveErr := a.saveConfig()
 	if saveErr != nil {
 		log.Error().Err(saveErr).Msg("failed to persist app.enabled")
 	}
