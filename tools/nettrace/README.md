@@ -141,6 +141,10 @@ Only **uncovered** (not already in MT), **non-RU**, IPv4 candidates are pushed; 
 rules are deduped; subnets wider than `/16` are refused unless `--allow-wide`. This
 replaces `mt_add_missing.ps1`.
 
+Confirmed pushes replace the group's rule list once through the batch `PUT /rules`
+API, preserving existing rule IDs. MT rebuilds ipsets and saves configuration once,
+regardless of how many new subnets are added.
+
 This fully replaces `network_watch.ps1` + `mt_add_missing.ps1` (TCP-only, UDP-blind).
 
 ## Troubleshooting: "it lags" / "it captures nothing"

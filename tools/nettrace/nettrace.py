@@ -183,17 +183,24 @@ class MTClient:
         names = ", ".join(f"{g.get('name')}({g.get('id')})" for g in groups)
         raise KeyError(f"group '{name_or_id}' not found. available: {names}")
 
-    def existing_rules(self, gid):
+    def get_rules(self, gid):
         r = requests.get(f"{self.base}/groups/{gid}/rules", timeout=8)
-        rules = r.json().get("rules", []) or []
-        return {rule.get("rule") for rule in rules}
-
-    def add_subnet_rule(self, gid, cidr, name):
-        rtype = "subnet6" if ":" in cidr else "subnet"
-        body = {"name": name, "type": rtype, "rule": cidr, "enable": True}
-        r = requests.post(f"{self.base}/groups/{gid}/rules?save=true", json=body, timeout=10)
         r.raise_for_status()
-        return r.json()
+        return r.json().get("rules", []) or []
+
+    def add_subnet_rules(self, gid, existing, additions):
+        """Append all additions with one replacement request and one MT sync/save."""
+        new_rules = list(existing)
+        for cidr, name in additions:
+            rtype = "subnet6" if ":" in cidr else "subnet"
+            new_rules.append({"name": name, "type": rtype, "rule": cidr, "enable": True})
+        r = requests.put(f"{self.base}/groups/{gid}/rules?save=true",
+                         json={"rules": new_rules}, timeout=30)
+        r.raise_for_status()
+        result = r.json().get("rules", []) or []
+        if len(result) != len(new_rules):
+            raise RuntimeError(f"batch rule update returned {len(result)}/{len(new_rules)} rules")
+        return result
 
 
 # ------------------------------------------------------------------- AWS ranges
@@ -1011,8 +1018,9 @@ def push_subnets(mt, group, subnet_map, confirm, allow_wide=False, labels=None):
         print("nothing to add (no uncovered candidates).")
         return
     gid, gname = mt.resolve_group(group)
-    existing = mt.existing_rules(gid)
-    print(f"\nGroup: {gname} (id={gid})  existing rules: {len(existing)}")
+    current_rules = mt.get_rules(gid)
+    existing = {rule.get("rule") for rule in current_rules}
+    print(f"\nGroup: {gname} (id={gid})  existing rules: {len(current_rules)}")
 
     wide = [s for s in subnet_map if ipaddress.ip_network(s).prefixlen < 16]
     if wide and not allow_wide:
@@ -1034,14 +1042,14 @@ def push_subnets(mt, group, subnet_map, confirm, allow_wide=False, labels=None):
     if not confirm:
         print(f"\n  {C_YELLOW}dry-run — add --confirm to actually push.{C_RESET}")
         return
-    ok = 0
-    for s in to_add:
-        try:
-            mt.add_subnet_rule(gid, s, labels.get(s) or f"nettrace {s}")
-            ok += 1
-        except Exception as ex:
-            print(f"    {C_YELLOW}FAILED {s}: {ex}{C_RESET}")
-    print(f"\n  {C_GREEN}added {ok}/{len(to_add)} subnets to '{gname}'. ipset synced.{C_RESET}")
+    additions = [(s, labels.get(s) or f"nettrace {s}") for s in to_add]
+    try:
+        mt.add_subnet_rules(gid, current_rules, additions)
+    except Exception as ex:
+        print(f"    {C_YELLOW}FAILED batch update: {ex}{C_RESET}")
+        return
+    print(f"\n  {C_GREEN}added {len(to_add)}/{len(to_add)} subnets to '{gname}' "
+          f"with one batch request. ipset synced.{C_RESET}")
 
 
 def _aws_cache_path():

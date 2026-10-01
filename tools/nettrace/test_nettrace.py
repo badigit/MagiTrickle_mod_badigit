@@ -17,6 +17,28 @@ import nettrace as nt
 
 
 class NettraceTests(unittest.TestCase):
+    def test_batch_rule_add_preserves_existing_and_uses_one_put(self):
+        mt = nt.MTClient("http://unused/api/v1/lookup", True)
+        existing = [{"id": "abc12345", "name": "old", "type": "subnet",
+                     "rule": "1.1.1.0/24", "enable": True}]
+        returned = existing + [{"id": "def67890", "name": "new", "type": "subnet",
+                                "rule": "2.2.2.0/24", "enable": True}]
+        response = types.SimpleNamespace(raise_for_status=lambda: None,
+                                         json=lambda: {"rules": returned})
+        with patch.object(nt.requests, "put", return_value=response) as put, \
+                patch.object(nt.requests, "post") as post:
+            result = mt.add_subnet_rules("group1", existing,
+                                         [("2.2.2.0/24", "new")])
+        self.assertEqual(result, returned)
+        post.assert_not_called()
+        put.assert_called_once()
+        args, kwargs = put.call_args
+        self.assertEqual(args[0], "http://unused/api/v1/groups/group1/rules?save=true")
+        self.assertEqual(kwargs["json"]["rules"][0], existing[0])
+        self.assertEqual(kwargs["json"]["rules"][1],
+                         {"name": "new", "type": "subnet",
+                          "rule": "2.2.2.0/24", "enable": True})
+
     def test_raw_udp_ipv4_ipv6_both_directions_and_timestamp(self):
         for fam, send_id, recv_id, dst, src in [(4, 42, 43, "8.8.8.8", "1.1.1.1"),
                                                (6, 58, 59, "2606:4700::1111", "2001:4860::8888")]:
