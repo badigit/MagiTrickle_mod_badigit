@@ -172,6 +172,24 @@ session only hands events over once a buffer fills. Kernel-Network events are ti
 so that is tens of seconds of apparent freeze. nettrace now uses 64 KB buffers with
 `FlushTimer = 1`.
 
+### Delivery lag and losses: decoder throughput
+
+The stock pywintrace decoder calls TDH to decode every selected packet across
+the machine before nettrace can apply a process filter. Under load this can use
+a full CPU core, fall minutes behind, and lose ETW events. Increasing buffers
+alone does not fix a consumer that cannot keep up.
+
+nettrace uses pywintrace's `RETURN_RAW_UNFORMATTED_DATA` mode, filters on the
+payload PID, and reads the fixed version-0 Kernel-Network prefix directly.
+Addresses and ports follow the documented [IPv4 network event layout](https://learn.microsoft.com/en-us/windows/win32/etw/udpip-typegroup1)
+and [IPv6 layout](https://learn.microsoft.com/en-us/windows/win32/etw/tcpip-sendipv6).
+Unsupported versions/short payloads are counted explicitly. Summary includes
+total events, unsupported payloads, delivery lag and ETW losses.
+
+Console and TSV timestamps now use the ETW event time, not the print time. Each
+run uses its own session name, and name filtering follows game restarts without
+a fixed `--pid`. The ETW flush interval can still add around a second of latency.
+
 ### Delivery lag: enrichment
 
 ASN/country/PTR are 1-3 blocking network round-trips per new IP. Inline they stalled

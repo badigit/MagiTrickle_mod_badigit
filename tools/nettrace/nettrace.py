@@ -23,6 +23,7 @@ import json
 import os
 import pathlib
 import socket
+import struct
 import sys
 import threading
 import time
@@ -38,6 +39,7 @@ try:
     from etw import ETW, ProviderInfo
     from etw.etw import TraceProperties
     from etw.GUID import GUID
+    from etw.common import RETURN_RAW_UNFORMATTED_DATA
 except ImportError:
     print("FATAL: pywintrace not installed. Run:  pip install pywintrace", file=sys.stderr)
     sys.exit(2)
@@ -335,10 +337,14 @@ class HostResolver:
 # ------------------------------------------------------------------- ETW capture
 class Capture:
     """Runs an ETW session in a background thread, pushes normalized events."""
-    def __init__(self, out_queue, want_tcp, want_udp, swap_ports, debug, want_in=False):
+    def __init__(self, out_queue, want_tcp, want_udp, swap_ports, debug, want_in=False, match_pid=None):
         self.q = out_queue
         self.debug = debug
         self.swap_ports = swap_ports
+        self.match_pid = match_pid
+        self.received = 0
+        self.unsupported = 0
+        self.max_lag = 0.0
         ids = [eid for eid, (proto, _, direction) in EVT.items()
                if ((proto == "TCP" and want_tcp) or (proto == "UDP" and want_udp))
                and (direction == "out" or want_in)]
@@ -351,12 +357,56 @@ class Capture:
         self.props = TraceProperties(ring_buf_size=64, min_buffers=16, max_buffers=64)
         self.props.get().contents.FlushTimer = 1
         self._etw = ETW(
+            session_name=f"MagiTrickle-nettrace-{os.getpid()}",
             providers=[provider],
             event_id_filters=list(ids),
-            event_callback=self._on_event,
+            # Stock TDH decoding performs metadata/property calls for every packet
+            # of every process. Use the SDK's raw mode and the provider's fixed
+            # version-0 network prefix; filter PID before copying/decoding addresses.
+            event_callback=self._on_raw,
+            callback_data_flag=RETURN_RAW_UNFORMATTED_DATA,
             properties=self.props,
         )
         self._debugged = False
+
+    def _on_raw(self, event):
+        _, pointer = event
+        record = pointer.contents
+        descriptor = record.EventHeader.EventDescriptor
+        eid = descriptor.Id
+        if eid not in self._ids:
+            return
+        self.received += 1
+        proto, fam, direction = EVT[eid]
+        length = 20 if fam == 4 else 44
+        if descriptor.Version != 0 or record.UserDataLength < length or not record.UserData:
+            self.unsupported += 1
+            return
+        pid = ctypes.c_uint32.from_address(record.UserData).value
+        if self.match_pid and not self.match_pid(pid):
+            return
+        payload = ctypes.string_at(record.UserData, length)
+        width = 4 if fam == 4 else 16
+        addr_offset = 8 if direction == "out" else 8 + width
+        port_offset = 8 + 2 * width + (0 if direction == "out" else 2)
+        ip = socket.inet_ntop(socket.AF_INET if fam == 4 else socket.AF_INET6,
+                              payload[addr_offset:addr_offset + width])
+        port = struct.unpack_from("!H", payload, port_offset)[0]
+        port = _norm_port(port, self.swap_ports)
+        size = struct.unpack_from("<I", payload, 4)[0]
+        # ProcessTrace converts timestamps to FILETIME unless RAW_TIMESTAMP is set.
+        event_time = (record.EventHeader.TimeStamp - 116444736000000000) / 10000000
+        now = time.time()
+        if not 0 < event_time <= now + 60:
+            self.unsupported += 1
+            return
+        self.max_lag = max(self.max_lag, now - event_time)
+        stamp = datetime.fromtimestamp(event_time)
+        if self.debug and not self._debugged:
+            self._debugged = True
+            print(f"[debug] raw id={eid} version={descriptor.Version} pid={pid} "
+                  f"remote={ip}:{port} bytes={payload.hex()} lag={now-event_time:.3f}s", file=sys.stderr)
+        self.q.put((proto, pid, ip, port, size, stamp))
 
     def _on_event(self, event):
         # pywintrace hands (event_id, {field: value})
@@ -505,7 +555,7 @@ def run(args):
         return False
 
     q = Queue()
-    cap = Capture(q, args.tcp, args.udp, args.port_swap, args.debug_fields, args.recv)
+    cap = Capture(q, args.tcp, args.udp, args.port_swap, args.debug_fields, args.recv, match)
 
     hostres = HostResolver(args.resolve_hostnames)
 
@@ -529,7 +579,9 @@ def run(args):
                 mt_queued.difference_update(mt_jobs.pop(f))
         new_ips = []
         rows = []
-        for proto, pid, ip, port, size in batch:
+        for event in batch:
+            proto, pid, ip, port, size, *timing = event
+            stamp = timing[0] if timing else None
             if not is_public(ip) or not match(pid):
                 continue
             if mt and mt.needs_lookup(ip) and ip not in mt_queued:
@@ -539,18 +591,18 @@ def run(args):
             if key in seen:
                 every = args.repeat_every
                 if every and (counts[key] == 2 or counts[key] % every == 0):
-                    rows.append((proto, pid, ip, port, counts[key], False))
+                    rows.append((proto, pid, ip, port, counts[key], False, stamp))
                 continue
             seen.add(key)
-            rows.append((proto, pid, ip, port, counts[key], True))
+            rows.append((proto, pid, ip, port, counts[key], True, stamp))
 
         # Router lookup must not block capture processing or output deadlines.
         if mt and new_ips:
             ips = list(dict.fromkeys(new_ips))
             mt_queued.update(ips)
             mt_jobs[mt_pool.submit(mt.annotate, ips)] = ips
-        for proto, pid, ip, port, hits, is_new in rows:
-            _emit(proto, pid, ip, port, hits, is_new, procs, mt, geo, hostres, tsv, enricher)
+        for proto, pid, ip, port, hits, is_new, stamp in rows:
+            _emit(proto, pid, ip, port, hits, is_new, procs, mt, geo, hostres, tsv, enricher, stamp)
         enricher.flush()
 
     print(f"Watching: name={name_filters or '*'} pid={sorted(pid_filters) or '*'}  "
@@ -606,6 +658,9 @@ def run(args):
         if tsv:
             tsv.close()
         _summary(counts, mt, geo)
+        if hasattr(cap, "received"):
+            print(f"  ETW events: {cap.received}; unsupported: {cap.unsupported}; "
+                  f"max delivery lag: {cap.max_lag:.3f}s")
 
         if args.learn or args.push_to_group:
             recs = build_records(counts, mt, geo)
@@ -644,7 +699,7 @@ def _color(country, mt, mt_hit):
     return C_RESET
 
 
-def _tsv_row(tsv, proto, pname, pid, ip, port, mt, detail):
+def _tsv_row(tsv, proto, pname, pid, ip, port, mt, detail, stamp=None):
     m = mt._cache.get(ip) if mt else None
     groups = (m or {}).get("groups", "")
     if not mt:
@@ -655,7 +710,7 @@ def _tsv_row(tsv, proto, pname, pid, ip, port, mt, detail):
         ipset = "n/a"
     else:
         ipset = "yes" if m["in_ipset"] else "no"
-    tsv.write(f"{datetime.now():%Y-%m-%d %H:%M:%S}\t{proto}\t{pname}\t{pid}\t{ip}\t{port}\t{groups}\t{ipset}\t{detail}\n")
+    tsv.write(f"{stamp or datetime.now():%Y-%m-%d %H:%M:%S}\t{proto}\t{pname}\t{pid}\t{ip}\t{port}\t{groups}\t{ipset}\t{detail}\n")
     tsv.flush()
 
 
@@ -754,7 +809,7 @@ class Enricher:
         with _print_lock:
             print(f"{color}{line}{C_RESET}")
         if self.tsv and e["is_new"]:
-            _tsv_row(self.tsv, e["proto"], e["pname"], e["pid"], e["ip"], e["port"], self.mt, detail)
+            _tsv_row(self.tsv, e["proto"], e["pname"], e["pid"], e["ip"], e["port"], self.mt, detail, e.get("observed_at"))
 
     def drain(self, timeout=15):
         """Wait for in-flight lookups, then print what is left — the summary and
@@ -778,7 +833,7 @@ class Enricher:
         self.pool.shutdown(wait=False, cancel_futures=True)
 
 
-def _emit(proto, pid, ip, port, hits, is_new, procs, mt, geo, hostres, tsv, enricher):
+def _emit(proto, pid, ip, port, hits, is_new, procs, mt, geo, hostres, tsv, enricher, observed_at=None):
     mt_tag, mt_hit = (mt.tag(ip) if mt else ("", False))
     meta = geo._cache.get(ip) or {}
     detail = meta.get("summary", "")
@@ -788,7 +843,8 @@ def _emit(proto, pid, ip, port, hits, is_new, procs, mt, geo, hostres, tsv, enri
 
     needs_lookup = is_new and enricher._claim(ip)
     enricher.add({
-        "ts": datetime.now().strftime("%H:%M:%S"),
+        "ts": (observed_at or datetime.now()).strftime("%H:%M:%S"),
+        "observed_at": observed_at,
         "proto": proto, "pid": pid, "pname": procs.name(pid) or f"pid{pid}",
         "ip": ip, "port": port, "hits": hits, "is_new": is_new,
         "mt_tag": mt_tag, "mt_hit": mt_hit,

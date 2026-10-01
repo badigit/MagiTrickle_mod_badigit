@@ -3,6 +3,7 @@
 Run: python -m unittest discover -s tools/nettrace -p test_nettrace.py
 """
 import contextlib
+import ctypes
 import io
 import tempfile
 import threading
@@ -16,6 +17,42 @@ import nettrace as nt
 
 
 class NettraceTests(unittest.TestCase):
+    def test_raw_udp_ipv4_ipv6_both_directions_and_timestamp(self):
+        for fam, send_id, recv_id, dst, src in [(4, 42, 43, "8.8.8.8", "1.1.1.1"),
+                                               (6, 58, 59, "2606:4700::1111", "2001:4860::8888")]:
+            family = nt.socket.AF_INET if fam == 4 else nt.socket.AF_INET6
+            payload = (nt.struct.pack("<II", 123, 80) + nt.socket.inet_pton(family, dst)
+                       + nt.socket.inet_pton(family, src) + nt.struct.pack("!HH", 8097, 8098))
+            buf = ctypes.create_string_buffer(payload)
+            cap = nt.Capture.__new__(nt.Capture)
+            cap.q = nt.Queue()
+            cap._ids = {send_id, recv_id}
+            cap.match_pid = lambda pid: pid == 123
+            cap.received = cap.unsupported = 0
+            cap.max_lag = 0.0
+            cap.debug = cap.swap_ports = False
+            recorded = nt.datetime.now()
+            stamp = int(recorded.timestamp() * 10000000) + 116444736000000000
+            descriptor = types.SimpleNamespace(Id=send_id, Version=0)
+            header = types.SimpleNamespace(EventDescriptor=descriptor, TimeStamp=stamp)
+            record = types.SimpleNamespace(EventHeader=header, UserDataLength=len(payload),
+                                           UserData=ctypes.addressof(buf))
+            pointer = types.SimpleNamespace(contents=record)
+            cap._on_raw((0, pointer))
+            descriptor.Id = recv_id
+            cap._on_raw((0, pointer))
+            out = cap.q.get_nowait()
+            incoming = cap.q.get_nowait()
+            self.assertEqual(out[:5], ("UDP", 123, dst, 8097, 80))
+            self.assertEqual(incoming[:5], ("UDP", 123, src, 8098, 80))
+            self.assertLess(abs((out[5] - recorded).total_seconds()), 0.001)
+            cap.match_pid = lambda pid: False
+            cap._on_raw((0, pointer))
+            self.assertTrue(cap.q.empty())
+            descriptor.Version = 99
+            cap._on_raw((0, pointer))
+            self.assertEqual(cap.unsupported, 1)
+
     def test_process_name_failure_retried_and_pid_reuse_expires(self):
         resolver = nt.ProcResolver()
         with patch.object(nt.time, "monotonic", return_value=10) as clock, \
