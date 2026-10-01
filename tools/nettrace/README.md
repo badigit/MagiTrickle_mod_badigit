@@ -57,7 +57,9 @@ Color = MagiTrickle intent (not actual path — see limitation):
 - **gray** — RU (excluded from tunneling by convention)
 
 `[MT:<group>]` = matched rule group · `[MT:ipset]` = in live ipset only ·
-`[MT:--]` = not in MagiTrickle.
+`[MT:--]` = not in MagiTrickle · `[MT:?]` = lookup pending or failed (gray).
+Failed lookups can be retried after 5 seconds; unknown coverage is excluded from
+push candidates and written as `unknown` in the TSV ipset column.
 
 ## Key flags
 
@@ -179,11 +181,18 @@ lookup in an ordered buffer for at most `--geo-hold` seconds (default 5) and the
 prints unenriched, so one dead lookup cannot freeze the live view. The result still
 lands in the cache, so `--learn` and the summary keep ASN and CIDR either way.
 
+MT lookup also runs off-thread. The same `--geo-hold` deadline bounds how long
+output waits for both MT and geo; an unfinished MT lookup prints `[MT:?]`.
+Use `--no-geo --geo-hold 0` for immediate output, with coverage shown once available
+on subsequent lines. ETW delivery and output scheduling still add latency.
+
 ### "It only caught it once"
 
 Repeat hits of the same `(protocol, PID, IP, port)` are suppressed — printed on the
 2nd hit, then every Nth. On a long-lived connection that reads as "it stopped
 tracking". Use `--repeat-every 1` to see every hit, `0` to silence repeats entirely.
+Counts are event counts, not connection counts. Local ports are not part of the
+key, and TSV records only the first occurrence of each endpoint.
 
 ### "It caught nothing at all"
 
@@ -202,6 +211,11 @@ gets a new PID whenever it restarts:
 $a = @(); foreach ($i in (Get-Process AnyDesk).Id) { $a += "--pid"; $a += "$i" }
 python nettrace.py @a --recv --repeat-every 1 --for 20
 ```
+
+Name lookup failures are retried after 0.5 seconds; successful names expire after
+2 seconds to handle PID reuse. At shutdown nettrace stops ETW and consumes its
+final queue before writing the summary and learn store. Loss statistics come from
+the running ETW session; an unavailable statistic is reported explicitly.
 
 ### Ports looked byte-swapped
 

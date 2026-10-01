@@ -28,7 +28,7 @@ import threading
 import time
 from collections import defaultdict, deque
 from datetime import datetime
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, wait
 from queue import Queue, Empty
 
 import requests
@@ -68,12 +68,20 @@ class ProcResolver:
     def __init__(self):
         self._cache = {}
         self._k = ctypes.windll.kernel32
+        self._k.OpenProcess.argtypes = [wt.DWORD, wt.BOOL, wt.DWORD]
+        self._k.OpenProcess.restype = wt.HANDLE
+        self._k.QueryFullProcessImageNameW.argtypes = [wt.HANDLE, wt.DWORD, wt.LPWSTR, ctypes.POINTER(wt.DWORD)]
+        self._k.QueryFullProcessImageNameW.restype = wt.BOOL
+        self._k.CloseHandle.argtypes = [wt.HANDLE]
+        self._k.CloseHandle.restype = wt.BOOL
 
     def name(self, pid):
-        if pid in self._cache:
-            return self._cache[pid]
+        cached = self._cache.get(pid)
+        if cached and time.monotonic() < cached[1]:
+            return cached[0]
         n = self._query(pid)
-        self._cache[pid] = n
+        # Retry failures and expire names too: Windows can reuse a PID.
+        self._cache[pid] = (n, time.monotonic() + (2 if n else 0.5))
         return n
 
     def _query(self, pid):
@@ -101,18 +109,27 @@ class MTClient:
         self.base = url.rsplit("/", 1)[0]  # .../api/v1/lookup -> .../api/v1
         self.check_ipset = check_ipset
         self._cache = {}  # ip -> dict(groups, in_ipset, has_hits)
+        self._failed_until = {}
+
+    def needs_lookup(self, ip):
+        return (self._cache.get(ip) is None
+                and time.monotonic() >= self._failed_until.get(ip, 0))
 
     def annotate(self, ips):
         """Batch-resolve unknown ips; results land in cache."""
-        todo = [ip for ip in ips if ip not in self._cache]
+        todo = [ip for ip in ips if self.needs_lookup(ip)]
         if not todo:
             return
         try:
             r = requests.post(self.url, json={"queries": todo, "check_ipset": self.check_ipset}, timeout=8)
+            r.raise_for_status()
             data = r.json()
+            if not isinstance(data, dict) or not isinstance(data.get("results"), list):
+                raise ValueError("invalid MT lookup response")
         except Exception:
             for ip in todo:
                 self._cache[ip] = None
+                self._failed_until[ip] = time.monotonic() + 5
             return
         seen = set()
         for item in data.get("results", []):
@@ -129,11 +146,13 @@ class MTClient:
             }
         for ip in todo:
             self._cache.setdefault(ip, None)
+            if self._cache[ip] is None:
+                self._failed_until[ip] = time.monotonic() + 5
 
     def tag(self, ip):
         mt = self._cache.get(ip)
         if not mt:
-            return "[MT:--]", False
+            return "[MT:?]", False
         if mt["groups"]:
             return f"[MT:{mt['groups']}]", True
         if mt["in_ipset"]:
@@ -141,9 +160,9 @@ class MTClient:
         return "[MT:--]", False
 
     def is_covered(self, ip):
-        """True if ip is already in a rule/ipset (no need to add)."""
+        """True/False for known coverage, None when the lookup failed/is pending."""
         mt = self._cache.get(ip)
-        return bool(mt and mt["has_hits"])
+        return bool(mt["has_hits"]) if mt is not None else None
 
     # ---- write API (push step) ----
     def get_groups(self):
@@ -371,9 +390,9 @@ class Capture:
 
     def events_lost(self):
         try:
-            return int(self.props.get().contents.EventsLost)
+            return int(self._etw.query().EventsLost)
         except Exception:
-            return 0
+            return None
 
     def start(self):
         self._etw.start()
@@ -381,8 +400,9 @@ class Capture:
     def stop(self):
         try:
             self._etw.stop()
+            return True
         except Exception:
-            pass
+            return False
 
 
 def _first(d, *keys, default=None):
@@ -445,20 +465,22 @@ def _stop_capture(cap, timeout=6):
     """ETW ProcessTrace can lag after CloseTrace (real-time buffer flush) — join it
     off-thread with a deadline and hard-exit if it overruns, so Ctrl+C never hangs."""
     done = threading.Event()
+    success = []
 
     def _worker():
         try:
-            cap.stop()
+            success.append(cap.stop() is not False)
         except Exception:
-            pass
+            success.append(False)
         done.set()
 
     threading.Thread(target=_worker, daemon=True).start()
     if not done.wait(timeout):
-        sys.stderr.write(f"{C_GRAY}(ETW session still flushing — exiting){C_RESET}\n")
+        sys.stderr.write(f"{C_GRAY}(ETW stop timed out — saving received events){C_RESET}\n")
         sys.stderr.flush()
         sys.stdout.flush()
-        os._exit(0)
+        return False
+    return success[0]
 
 
 def run(args):
@@ -497,6 +519,39 @@ def run(args):
     counts = defaultdict(int)          # key -> hit count
     seen = set()
     enricher = Enricher(geo, hostres, tsv, mt, workers=args.geo_workers, hold=args.geo_hold)
+    mt_pool = ThreadPoolExecutor(max_workers=1) if mt else None
+    mt_jobs = {}
+    mt_queued = set()
+
+    def process_batch(batch):
+        for f in list(mt_jobs):
+            if f.done():
+                mt_queued.difference_update(mt_jobs.pop(f))
+        new_ips = []
+        rows = []
+        for proto, pid, ip, port, size in batch:
+            if not is_public(ip) or not match(pid):
+                continue
+            if mt and mt.needs_lookup(ip) and ip not in mt_queued:
+                new_ips.append(ip)
+            key = (proto, pid, ip, port)
+            counts[key] += 1
+            if key in seen:
+                every = args.repeat_every
+                if every and (counts[key] == 2 or counts[key] % every == 0):
+                    rows.append((proto, pid, ip, port, counts[key], False))
+                continue
+            seen.add(key)
+            rows.append((proto, pid, ip, port, counts[key], True))
+
+        # Router lookup must not block capture processing or output deadlines.
+        if mt and new_ips:
+            ips = list(dict.fromkeys(new_ips))
+            mt_queued.update(ips)
+            mt_jobs[mt_pool.submit(mt.annotate, ips)] = ips
+        for proto, pid, ip, port, hits, is_new in rows:
+            _emit(proto, pid, ip, port, hits, is_new, procs, mt, geo, hostres, tsv, enricher)
+        enricher.flush()
 
     print(f"Watching: name={name_filters or '*'} pid={sorted(pid_filters) or '*'}  "
           f"proto={'TCP' if args.tcp else ''}{'/' if args.tcp and args.udp else ''}{'UDP' if args.udp else ''}")
@@ -524,36 +579,28 @@ def run(args):
             except Empty:
                 pass
 
-            new_ips = []
-            rows = []
-            for proto, pid, ip, port, size in batch:
-                if not is_public(ip) or not match(pid):
-                    continue
-                key = (proto, pid, ip, port)
-                counts[key] += 1
-                if key in seen:
-                    every = args.repeat_every
-                    if every and (counts[key] == 2 or counts[key] % every == 0):
-                        rows.append((proto, pid, ip, port, counts[key], False))
-                    continue
-                seen.add(key)
-                if mt and ip not in mt._cache:
-                    new_ips.append(ip)
-                rows.append((proto, pid, ip, port, counts[key], True))
-
-            # MT lookup stays synchronous: it is one batched call to the router on
-            # the LAN and it decides the line's colour. Geo/PTR go off-thread.
-            if mt and new_ips:
-                mt.annotate(list(dict.fromkeys(new_ips)))
-
-            for proto, pid, ip, port, hits, is_new in rows:
-                _emit(proto, pid, ip, port, hits, is_new, procs, mt, geo, hostres, tsv, enricher)
-            enricher.flush()
+            process_batch(batch)
     except KeyboardInterrupt:
         print(f"\n{C_GRAY}Ctrl+C — stopping...{C_RESET}")
     finally:
-        # Summary/push FIRST so results appear instantly on Ctrl+C — the ETW stop
-        # below can lag while ProcessTrace flushes real-time buffers.
+        # Stop the producer, then consume its final flush before summary/learn.
+        lost = cap.events_lost()
+        stopped = _stop_capture(cap)
+        remaining = q.qsize()
+        while remaining:
+            batch = []
+            try:
+                while len(batch) < min(500, remaining):
+                    batch.append(q.get_nowait())
+            except Empty:
+                pass
+            if not batch:
+                break
+            remaining -= len(batch)
+            process_batch(batch)
+        if mt_pool:
+            wait(mt_jobs, timeout=args.geo_wait)
+            mt_pool.shutdown(wait=False, cancel_futures=True)
         enricher.drain(args.geo_wait)
         enricher.shutdown()
         if tsv:
@@ -573,10 +620,15 @@ def run(args):
                     subnet_map, labels = aggregate(recs, args.agg, args.min_count, args.promote16, aws)
                     push_subnets(mt, args.push_to_group, subnet_map, args.confirm, args.allow_wide, labels)
 
-        lost = getattr(cap, "events_lost", lambda: 0)()
-        if lost:
-            print(f"{C_YELLOW}ETW dropped {lost} events (buffers too small){C_RESET}")
-        _stop_capture(cap)
+        if lost is None:
+            print(f"{C_YELLOW}ETW loss statistics unavailable{C_RESET}")
+        else:
+            print(f"{C_YELLOW}ETW dropped {lost} events{C_RESET}")
+        if not stopped:
+            print(f"{C_YELLOW}Capture incomplete: ETW did not stop within the deadline{C_RESET}")
+            sys.stdout.flush()
+            sys.stderr.flush()
+            os._exit(1)
 
 
 _print_lock = threading.Lock()
@@ -598,7 +650,7 @@ def _tsv_row(tsv, proto, pname, pid, ip, port, mt, detail):
     if not mt:
         ipset = ""
     elif not m:
-        ipset = "no"
+        ipset = "unknown"
     elif m["in_ipset"] is None:
         ipset = "n/a"
     else:
@@ -683,19 +735,22 @@ class Enricher:
         with self._lk:
             while self._queue:
                 e = self._queue[0]
-                if not (force or e["ready"] or now >= e["deadline"]):
+                mt_ready = not self.mt or self.mt._cache.get(e["ip"]) is not None
+                if not (force or (e["ready"] and mt_ready) or now >= e["deadline"]):
                     break
                 out.append(self._queue.popleft())
         for e in out:
             self._print(e)
 
     def _print(self, e):
+        if self.mt:
+            e["mt_tag"], e["mt_hit"] = self.mt.tag(e["ip"])
         detail = e["detail"]
         tail = f" [x{e['hits']}]" if e["hits"] > 1 else ""
         line = f"[{e['ts']}] [{e['pname']}] {e['proto']} {e['ip']}:{e['port']} {e['mt_tag']}{tail}"
         if detail:
             line += f"  {detail}"
-        color = _color(e["country"], self.mt, e["mt_hit"])
+        color = C_GRAY if e["mt_tag"] == "[MT:?]" else _color(e["country"], self.mt, e["mt_hit"])
         with _print_lock:
             print(f"{color}{line}{C_RESET}")
         if self.tsv and e["is_new"]:
@@ -751,10 +806,14 @@ def _summary(counts, mt, geo):
     print(f"  unique endpoints: {uniq}")
     if mt:
         missing = []
+        unknown = []
         for (proto, pid, ip, port) in counts:
             if geo._cache.get(ip, {}).get("country") == "RU":
                 continue
-            _, hit = mt.tag(ip)
+            tag, hit = mt.tag(ip)
+            if tag == "[MT:?]":
+                unknown.append(ip)
+                continue
             if not hit:
                 missing.append(ip)
         miss_u = sorted(set(missing))
@@ -762,8 +821,12 @@ def _summary(counts, mt, geo):
             print(f"  {C_YELLOW}NOT in MagiTrickle ({len(miss_u)} ips):{C_RESET}")
             for ip in miss_u:
                 print(f"    [--] {ip}")
-        else:
+        elif not unknown:
             print(f"  {C_GREEN}all non-RU endpoints covered by MagiTrickle.{C_RESET}")
+        if unknown:
+            print(f"  {C_GRAY}MT coverage unknown ({len(set(unknown))} ips):{C_RESET}")
+            for ip in sorted(set(unknown)):
+                print(f"    [?] {ip}")
 
 
 # ------------------------------------------------------------------- learn / push
@@ -825,7 +888,8 @@ def aggregate(records, mode="cidr", min_count=1, promote16_at=0, aws=None):
     non-RU, IPv4 candidates seen >= min_count times."""
     cands = []
     for ip, e in records.items():
-        if e.get("covered") or e.get("count", 0) < min_count or e.get("cc") == "RU":
+        if (("covered" in e and e["covered"] is None) or e.get("covered")
+                or e.get("count", 0) < min_count or e.get("cc") == "RU"):
             continue
         try:
             if ipaddress.ip_address(ip).version != 4:
