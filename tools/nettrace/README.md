@@ -44,6 +44,24 @@ python nettrace.py --pid 12345 --no-tcp
 python nettrace.py -n RocketLeague --debug-fields
 ```
 
+### One coordinated ETW + router DNS session
+
+`--dns-capture` starts MagiTrickle's DNS capture immediately after ETW starts and
+stops it in the same cleanup path on timeout, Ctrl+C, or a startup error. It
+refuses to overwrite a DNS capture that is already active. The client LAN address
+is detected from the Windows route to MagiTrickle; override it with `--client-ip`.
+
+```powershell
+python nettrace.py -n RocketLeague --for 600 --recv `
+  --tsv rl-session.tsv --learn rlgame.json --dns-capture
+```
+
+The final domain list is written to `rl-session.dns.json`. Use `--dns-out FILE`
+when no TSV is needed or a different path is desired. DNS capture records queried
+names and counts; the current MT API does not retain DNS answers or per-query
+timestamps, so this proves which domains were queried during the same window but
+cannot by itself map every domain to a captured destination IP.
+
 ### Output
 
 ```
@@ -73,6 +91,9 @@ push candidates and written as `unknown` in the TSV ipset column.
 | `--no-udp` / `--no-tcp` | restrict protocol |
 | `--no-geo` | skip ASN/country lookup |
 | `--ipinfo-token TOKEN` | ipinfo.io token; defaults to `$IPINFO_TOKEN`, empty = anonymous endpoint |
+| `--dns-capture` | start and stop MT DNS capture with this ETW session |
+| `--client-ip IP` | LAN client filter for DNS capture (default: auto-detect) |
+| `--dns-out FILE` | final DNS JSON (default: TSV name with `.dns.json`) |
 | `--tsv PATH` | also write TSV log |
 | `--append` | append to existing `--tsv` instead of overwriting |
 | `--resolve-hostnames` | reverse-DNS (PTR) each destination IP |

@@ -27,6 +27,7 @@ import struct
 import sys
 import threading
 import time
+from urllib.parse import urlparse
 from collections import defaultdict, deque
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, wait
@@ -201,6 +202,62 @@ class MTClient:
         if len(result) != len(new_rules):
             raise RuntimeError(f"batch rule update returned {len(result)}/{len(new_rules)} rules")
         return result
+
+    # ---- coordinated diagnostic capture ----
+    def start_dns_capture(self, filter_ip):
+        """Start a fresh MT DNS capture, without clobbering another session."""
+        status_url = f"{self.base}/system/dns-capture/status"
+        r = requests.get(status_url, timeout=8)
+        r.raise_for_status()
+        status = r.json()
+        if status.get("active"):
+            raise RuntimeError("MT DNS capture is already active; refusing to reset it")
+        r = requests.post(f"{self.base}/system/dns-capture/start",
+                          json={"filter_ip": filter_ip}, timeout=8)
+        r.raise_for_status()
+        status = r.json()
+        if not status.get("active"):
+            raise RuntimeError("MT DNS capture did not become active")
+        return status
+
+    def stop_dns_capture(self):
+        """Stop MT DNS capture and return its final domain list."""
+        r = requests.post(f"{self.base}/system/dns-capture/stop", json={}, timeout=8)
+        r.raise_for_status()
+        status = r.json()
+        if status.get("active"):
+            raise RuntimeError("MT DNS capture remained active after stop")
+        return status
+
+
+def _source_ip_for(url):
+    """Return the local IPv4 address Windows routes towards the MT endpoint."""
+    host = urlparse(url).hostname
+    if not host:
+        raise ValueError(f"cannot determine router host from {url!r}")
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+        s.connect((host, 53))
+        return s.getsockname()[0]
+
+
+def _dns_output_path(args):
+    if args.dns_out:
+        return args.dns_out
+    if args.tsv:
+        return str(pathlib.Path(args.tsv).with_suffix(".dns.json"))
+    return None
+
+
+def _save_dns_capture(path, status, filter_ip):
+    payload = dict(status)
+    payload["filter_ip"] = filter_ip
+    payload["stopped_at"] = datetime.now().astimezone().isoformat(timespec="seconds")
+    if path:
+        out = pathlib.Path(path)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+                       encoding="utf-8")
+    return payload
 
 
 # ------------------------------------------------------------------- AWS ranges
@@ -624,8 +681,26 @@ def run(args):
               f"elevated shell (right-click terminal -> Run as administrator).{C_RESET}",
               file=sys.stderr)
         sys.exit(1)
+    dns_started = False
+    dns_filter_ip = None
+    dns_stop_error = None
     deadline = None if args.duration == 0 else time.time() + args.duration
     try:
+        if args.dns_capture:
+            if mt is None:
+                print(f"{C_YELLOW}FATAL: --dns-capture needs MagiTrickle URL{C_RESET}",
+                      file=sys.stderr)
+                raise SystemExit(1)
+            try:
+                dns_filter_ip = args.client_ip or _source_ip_for(args.mt_url)
+                started = mt.start_dns_capture(dns_filter_ip)
+            except Exception as exc:
+                print(f"{C_YELLOW}FATAL: cannot start MT DNS capture: {exc}{C_RESET}",
+                      file=sys.stderr)
+                raise SystemExit(1)
+            dns_started = True
+            print(f"MT DNS capture: started for client {dns_filter_ip} "
+                  f"at {started.get('started_at', 'now')}")
         while True:
             if deadline and time.time() >= deadline:
                 break
@@ -642,8 +717,21 @@ def run(args):
     except KeyboardInterrupt:
         print(f"\n{C_GRAY}Ctrl+C — stopping...{C_RESET}")
     finally:
-        # Stop the producer, then consume its final flush before summary/learn.
+        # Close the shared capture window before ETW's potentially slow flush.
         lost = cap.events_lost()
+        if dns_started:
+            try:
+                dns_status = mt.stop_dns_capture()
+                dns_started = False
+                dns_path = _dns_output_path(args)
+                payload = _save_dns_capture(dns_path, dns_status, dns_filter_ip)
+                suffix = f" -> {dns_path}" if dns_path else ""
+                print(f"MT DNS capture: stopped, {payload.get('count', 0)} domains{suffix}")
+            except Exception as exc:
+                dns_stop_error = exc
+                print(f"{C_YELLOW}WARNING: cannot stop MT DNS capture: {exc}{C_RESET}",
+                      file=sys.stderr)
+        # Stop the producer, then consume its final flush before summary/learn.
         stopped = _stop_capture(cap)
         remaining = q.qsize()
         while remaining:
@@ -691,6 +779,8 @@ def run(args):
             sys.stdout.flush()
             sys.stderr.flush()
             os._exit(1)
+        if dns_stop_error is not None:
+            raise SystemExit(1)
 
 
 _print_lock = threading.Lock()
@@ -1146,6 +1236,11 @@ def build_parser():
     p.add_argument("--tsv", help="also write TSV to this path")
     p.add_argument("--append", action="store_true", help="append to existing --tsv instead of overwriting")
     p.add_argument("--resolve-hostnames", action="store_true", help="reverse-DNS each destination IP (PTR)")
+    p.add_argument("--dns-capture", action="store_true",
+                   help="start MT DNS capture with ETW and stop it on every exit")
+    p.add_argument("--client-ip", help="LAN client IP for --dns-capture (default: auto-detect route to MT)")
+    p.add_argument("--dns-out", metavar="FILE",
+                   help="save final DNS capture JSON (default: --tsv path with .dns.json suffix)")
     p.add_argument("--port-swap", action="store_true",
                    help="ntohs() ETW ports — only if ports look byte-swapped (443 shown as 47873)")
     p.add_argument("--no-port-swap", action="store_true", help=argparse.SUPPRESS)  # kept: was the old default-off switch

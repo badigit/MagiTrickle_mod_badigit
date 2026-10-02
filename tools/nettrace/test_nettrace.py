@@ -17,6 +17,54 @@ import nettrace as nt
 
 
 class NettraceTests(unittest.TestCase):
+    def test_dns_capture_session_starts_and_stops_through_mt_api(self):
+        mt = nt.MTClient("http://router:8080/api/v1/lookup", True)
+        responses = [
+            types.SimpleNamespace(raise_for_status=lambda: None,
+                                  json=lambda: {"active": False, "count": 0}),
+            types.SimpleNamespace(raise_for_status=lambda: None,
+                                  json=lambda: {"active": True, "count": 0,
+                                                "started_at": "2026-10-02T01:00:00+03:00"}),
+            types.SimpleNamespace(raise_for_status=lambda: None,
+                                  json=lambda: {"active": False, "count": 1,
+                                                "domains": [{"domain": "example.com", "count": 2}]}),
+        ]
+        with patch.object(nt.requests, "get", return_value=responses[0]) as get, \
+                patch.object(nt.requests, "post", side_effect=responses[1:]) as post:
+            started = mt.start_dns_capture("10.9.0.2")
+            stopped = mt.stop_dns_capture()
+        self.assertTrue(started["active"])
+        self.assertEqual(stopped["domains"][0]["domain"], "example.com")
+        get.assert_called_once_with(
+            "http://router:8080/api/v1/system/dns-capture/status", timeout=8)
+        self.assertEqual(post.call_args_list[0].args[0],
+                         "http://router:8080/api/v1/system/dns-capture/start")
+        self.assertEqual(post.call_args_list[0].kwargs["json"],
+                         {"filter_ip": "10.9.0.2"})
+        self.assertEqual(post.call_args_list[1].args[0],
+                         "http://router:8080/api/v1/system/dns-capture/stop")
+
+    def test_dns_capture_refuses_to_reset_active_session(self):
+        mt = nt.MTClient("http://router:8080/api/v1/lookup", True)
+        response = types.SimpleNamespace(raise_for_status=lambda: None,
+                                         json=lambda: {"active": True, "count": 3})
+        with patch.object(nt.requests, "get", return_value=response), \
+                patch.object(nt.requests, "post") as post:
+            with self.assertRaisesRegex(RuntimeError, "already active"):
+                mt.start_dns_capture("10.9.0.2")
+        post.assert_not_called()
+
+    def test_dns_output_defaults_to_tsv_stem_and_saves_metadata(self):
+        args = types.SimpleNamespace(dns_out=None, tsv="capture.tsv")
+        self.assertEqual(nt._dns_output_path(args), "capture.dns.json")
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "dns.json"
+            payload = nt._save_dns_capture(
+                path, {"active": False, "count": 0}, "10.9.0.2")
+            self.assertEqual(payload["filter_ip"], "10.9.0.2")
+            saved = path.read_text(encoding="utf-8")
+            self.assertIn('"stopped_at"', saved)
+
     def test_batch_rule_add_preserves_existing_and_uses_one_put(self):
         mt = nt.MTClient("http://unused/api/v1/lookup", True)
         existing = [{"id": "abc12345", "name": "old", "type": "subnet",
