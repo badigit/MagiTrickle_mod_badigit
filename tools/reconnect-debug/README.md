@@ -1,5 +1,9 @@
 # reconnect-debug — детерминированная локализация реконнектов «второй раз работает»
 
+Общая оценка нод/каналов и приёмка BBR/pacing/shaper —
+[net-diag в infra-docker](C:/Users/Dee/GitHub/infra-docker/tools/net-diag/WORKFLOW.md).
+Этот каталог отвечает за роутерные улики и реконнекты; общий процесс ссылается сюда.
+
 Harness для эпика **mt-ejz**. Цель — НЕ угадывать, а инструментально определить, на каком
 слое рвётся первый коннект (а второй проходит): DNS-resolve / nftset-routing / mihomo-tunnel.
 
