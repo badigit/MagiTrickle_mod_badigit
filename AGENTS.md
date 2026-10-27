@@ -2,16 +2,7 @@
 
 This project uses **bd** (beads) for issue tracking. Run `bd prime` for full workflow context.
 
-> **Architecture in one line:** Issues live in a local Dolt database
-> (`.beads/dolt/`); cross-machine sync uses `bd dolt push/pull` (a
-> git-compatible protocol), stored under `refs/dolt/data` on your git
-> remote — separate from `refs/heads/*` where your code lives.
-> `.beads/issues.jsonl` is a passive export, not the wire protocol.
->
-> See [SYNC_CONCEPTS.md](https://github.com/gastownhall/beads/blob/main/docs/SYNC_CONCEPTS.md)
-> for the one-screen overview and anti-patterns (don't treat JSONL as the
-> source of truth; don't `bd import` during normal operation; don't
-> reach for third-party Dolt hosting before trying the default).
+> Task storage: shared Dolt SQL server. Source: `.beads/metadata.json`; no `bd dolt push/pull` in server mode.
 
 ## Quick Reference
 
@@ -20,7 +11,6 @@ bd ready              # Find available work
 bd show <id>          # View issue details
 bd update <id> --claim  # Claim work atomically
 bd close <id>         # Complete work
-bd dolt push          # Push beads data to remote
 ```
 
 ## Non-Interactive Shell Commands
@@ -68,7 +58,7 @@ bd close <id>         # Complete work
 - Use `bd remember` for persistent knowledge — do NOT use MEMORY.md files
 - This project's beads DB runs in server mode (central Dolt server) — there is no `dolt` git remote configured. Do NOT run `bd dolt push`/`bd dolt pull`; they will fail.
 
-**Architecture in one line:** issues live in a local Dolt DB; sync uses `refs/dolt/data` on your git remote; `.beads/issues.jsonl` is a passive export. See https://github.com/gastownhall/beads/blob/main/docs/SYNC_CONCEPTS.md for details and anti-patterns.
+Task storage: shared Dolt SQL server. Source: `.beads/metadata.json`; no `bd dolt push/pull` in server mode.
 
 ## Session Completion
 
@@ -79,7 +69,6 @@ bd close <id>         # Complete work
 3. **Update issue status** - Close finished work, update in-progress items
 4. **Commit** freely and proactively as work progresses — do not wait until end of session or for permission to commit
 5. **Do NOT push to remote** unless the developer explicitly asks — leaving finished work committed but unpushed locally is the expected default
-6. **Clean up** - Clear stashes, prune stale local branches
 7. **Hand off** - Provide context for next session
 
 **Rules:**

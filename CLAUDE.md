@@ -22,7 +22,7 @@ bd close <id>         # Complete work
 - Run `bd prime` for detailed command reference
 - Commit freely and proactively as work progresses — push to remote only when the developer explicitly asks
 
-**Architecture in one line:** issues live in a local Dolt DB; sync uses `refs/dolt/data` on your git remote; `.beads/issues.jsonl` is a passive export. See https://github.com/gastownhall/beads/blob/main/docs/SYNC_CONCEPTS.md for details and anti-patterns.
+Task storage: shared Dolt SQL server. Source: `.beads/metadata.json`; no `bd dolt push/pull` in server mode.
 <!-- END BEADS INTEGRATION -->
 
 
