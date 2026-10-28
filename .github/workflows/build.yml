@@ -1,10 +1,16 @@
 name: Build and Package OPKG
 
 on:
+  push:
+    branches-ignore:
+      - 'refs/tags/*'
+      - release
+    paths-ignore:
+      - '**.md'
+      - '.github/**'
+      - '!.github/workflows/build.yml'
   release:
-    types:
-    - published
-  workflow_dispatch:
+    types: [published]
 
 jobs:
   prepare:
