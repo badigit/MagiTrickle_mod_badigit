@@ -1,10 +1,17 @@
 package magitrickle
 
 import (
+	"context"
+	"net"
 	"testing"
+	"time"
 
 	"magitrickle/models"
+	"magitrickle/utils/netfilterTools"
+	"magitrickle/utils/recordsCache"
 	"magitrickle/utils/trie"
+
+	"github.com/miekg/dns"
 )
 
 // Эти тесты замораживают продуктовую политику арбитража доменов (mt-7rd,
@@ -37,6 +44,55 @@ func newSearchApp(base, subs []*Group) *App {
 	a.subscriptionGroups.Store(&subs)
 	a.RebuildTrie()
 	return a
+}
+
+func TestWildcardRoutingWithSavedDNSCache(t *testing.T) {
+	group := sdGroup("G", true,
+		sdRule(models.RuleTypeWildcard, "*.example.com"),
+		sdRule(models.RuleTypeWildcard, "legacy.example.net"),
+	)
+	a := newSearchApp([]*Group{group}, nil)
+	group.app = a
+	a.routingActive.Store(true)
+
+	oldCache := recordsCache.New()
+	cases := []struct {
+		name string
+		ip   [4]byte
+		why  string
+	}{
+		{"a.b.example.com", [4]byte{192, 0, 2, 1}, models.LookupWhyWildcard},
+		{"xexample.com", [4]byte{192, 0, 2, 2}, ""},
+		{"child.legacy.example.net", [4]byte{192, 0, 2, 3}, models.LookupWhyNamespace},
+		{"xlegacy.example.net", [4]byte{192, 0, 2, 4}, ""},
+	}
+	for _, tc := range cases {
+		oldCache.AddAddress(tc.name, net.IP(tc.ip[:]), 60)
+	}
+	a.recordsCache = recordsCache.New()
+	a.recordsCache.LoadSnapshot(oldCache.Snapshot())
+
+	v4, _ := group.desiredSubnets(time.Now(), nil, nil)
+	for _, tc := range cases {
+		match := tc.why != ""
+		query := new(dns.Msg).SetQuestion(dns.Fqdn(tc.name), dns.TypeA)
+		if fallback := a.selectUpstream(*query); fallback == match {
+			t.Errorf("fallback for %s = %t, want %t", tc.name, fallback, !match)
+		}
+		if _, why, found := a.SearchDomainVerdict(tc.name); found != match || why != tc.why {
+			t.Errorf("verdict for %s: found %t, why %q; want %t, %q", tc.name, found, why, match, tc.why)
+		}
+		if _, included := v4[netfilterTools.IPv4Host(tc.ip)]; included != match {
+			t.Errorf("rebuilt ipset membership for %s = %t, want %t", tc.name, included, match)
+		}
+	}
+	// Cancellation keeps this test local while exercising Warmup's target selection.
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	res, err := a.Warmup(ctx)
+	if err != nil || res.Matched != 2 || res.Queried != 0 {
+		t.Fatalf("warmup selection = %+v, err = %v; want two matches and no queries", res, err)
+	}
 }
 
 // TestSearchDomainArbitration покрывает кросс-групповой и кросс-слойный

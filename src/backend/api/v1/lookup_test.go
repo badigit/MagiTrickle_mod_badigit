@@ -141,6 +141,31 @@ func TestLookupNoWinner(t *testing.T) {
 	}
 }
 
+func TestLookupWildcardRuleHits(t *testing.T) {
+	a := &fakeLookupApp{groups: []app.Group{lookupGroup("G",
+		&models.Rule{Type: models.RuleTypeWildcard, Rule: "*.example.com", Enable: true},
+		&models.Rule{Type: models.RuleTypeWildcard, Rule: "legacy.example.net", Enable: true},
+	)}, routingActive: true}
+	res := doLookup(t, a, types.LookupReq{Queries: []string{
+		"a.b.example.com", "xexample.com", "child.legacy.example.net",
+	}})
+	if len(res.Results) != 3 {
+		t.Fatalf("lookup returned %d results, want 3", len(res.Results))
+	}
+	for i, want := range []string{models.LookupWhyWildcard, "", models.LookupWhyNamespace} {
+		hits := res.Results[i].RuleHits
+		if want == "" {
+			if len(hits) != 0 {
+				t.Errorf("result %d: unexpected matches: %+v", i, hits)
+			}
+			continue
+		}
+		if len(hits) != 1 || hits[0].Match != want || hits[0].RuleType != models.RuleTypeWildcard {
+			t.Errorf("result %d: matches = %+v, want one wildcard rule matched as %q", i, hits, want)
+		}
+	}
+}
+
 // IP: победитель — первая по порядку группа, в чьём ipset адрес уже лежит.
 // Это фактический исход для пакета, поэтому pending=false.
 func TestLookupWinnerIpsetFirst(t *testing.T) {

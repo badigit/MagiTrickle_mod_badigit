@@ -352,7 +352,10 @@ func matchRule(rule *models.Rule, qLower string, qIP net.IP, qNet *net.IPNet, sr
 
 	case models.RuleTypeWildcard:
 		if rule.IsMatch(qLower) {
-			hit.Match = "wildcard"
+			hit.Match = models.LookupWhyWildcard
+			if !models.WildcardHasGlob(rule.Rule) {
+				hit.Match = models.LookupWhyNamespace
+			}
 			return &hit
 		}
 

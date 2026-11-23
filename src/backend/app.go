@@ -7,7 +7,6 @@ import (
 	"os"
 	"os/exec"
 	"slices"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -21,7 +20,6 @@ import (
 	"magitrickle/utils/recordsCache"
 	"magitrickle/utils/trie"
 
-	"github.com/IGLOU-EU/go-wildcard/v2"
 	"github.com/rs/zerolog/log"
 	"github.com/vishvananda/netlink"
 	"github.com/vishvananda/netlink/nl"
@@ -164,15 +162,14 @@ func (a *App) RebuildTrie() {
 			case models.RuleTypeDomain:
 				newTrie.Insert(rule.Rule, g, true)
 			case models.RuleTypeWildcard:
-				if strings.Contains(rule.Rule, "*") || strings.Contains(rule.Rule, "?") {
+				if models.WildcardHasGlob(rule.Rule) {
 					newWildcards = append(newWildcards, &WildcardRule{
 						Rule:  rule.Rule,
 						Group: g,
 					})
 				} else {
 					// wildcard without glob chars is effectively a namespace
-					cleanDomain := strings.TrimPrefix(rule.Rule, "*.")
-					newTrie.Insert(cleanDomain, g, false)
+					newTrie.Insert(rule.Rule, g, false)
 				}
 			case models.RuleTypeNamespace:
 				newTrie.Insert(rule.Rule, g, false)
@@ -227,7 +224,7 @@ func (a *App) searchDomainExplain(domain string) (*Group, string, bool) {
 	wRules := a.wildcardRules
 	a.wildcardRulesLocker.RUnlock()
 	for _, wr := range wRules {
-		if wildcard.Match(wr.Rule, domain) {
+		if models.MatchWildcardGlob(wr.Rule, domain) {
 			if wr.Group.Enabled() && wr.Group.Group.Enable {
 				return wr.Group, models.LookupWhyWildcard, true
 			}
