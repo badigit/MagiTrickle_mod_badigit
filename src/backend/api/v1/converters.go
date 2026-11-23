@@ -29,10 +29,6 @@ func detachedGroupFromReq(req types.GroupReq, existing *models.Group) (*models.G
 		return GroupFromReq(req, nil)
 	}
 	group := *existing
-	group.Rules = make([]*models.Rule, len(existing.Rules))
-	for i, rule := range existing.Rules {
-		group.Rules[i] = &models.Rule{ID: rule.ID, Name: rule.Name, Type: rule.Type, Rule: rule.Rule, Enable: rule.Enable}
-	}
 	return GroupFromReq(req, &group)
 }
 
@@ -65,37 +61,32 @@ func GroupFromReq(req types.GroupReq, existing *models.Group) (*models.Group, er
 	if req.Rules != nil {
 		newRules := make([]*models.Rule, len(*req.Rules))
 		for i, ruleReq := range *req.Rules {
-			r, err := RuleFromReq(ruleReq, group.Rules)
-			if err != nil {
-				return nil, err
-			}
-			newRules[i] = r
+			newRules[i] = RuleFromReq(ruleReq, group.Rules)
 		}
 		group.Rules = newRules
 	}
 	return group, nil
 }
 
-func RuleFromReq(ruleReq types.RuleReq, existingRules []*models.Rule) (*models.Rule, error) {
-	var rule *models.Rule
+func RuleFromReq(ruleReq types.RuleReq, existingRules []*models.Rule) *models.Rule {
 	if ruleReq.ID != nil {
 		for _, r := range existingRules {
 			if r.ID == *ruleReq.ID {
-				rule = r
-				break
+				return newRuleFromReq(ruleReq, r.ID)
 			}
 		}
 	}
-	if rule == nil {
-		rule = &models.Rule{
-			ID: intID.RandomID(),
-		}
+	return newRuleFromReq(ruleReq, intID.RandomID())
+}
+
+func newRuleFromReq(req types.RuleReq, id intID.ID) *models.Rule {
+	return &models.Rule{
+		ID:     id,
+		Name:   req.Name,
+		Type:   req.Type,
+		Rule:   req.Rule,
+		Enable: req.Enable,
 	}
-	rule.Name = ruleReq.Name
-	rule.Type = ruleReq.Type
-	rule.Rule = ruleReq.Rule
-	rule.Enable = ruleReq.Enable
-	return rule, nil
 }
 
 func RespFromGroups(groups []*models.Group, withRules bool) types.GroupsRes {
@@ -172,11 +163,7 @@ func SubscriptionFromReq(req types.SubscriptionReq, existing *models.Subscriptio
 	if req.Rules != nil {
 		newRules := make([]*models.Rule, len(*req.Rules))
 		for i, ruleReq := range *req.Rules {
-			r, err := RuleFromReq(ruleReq, subscription.Rules)
-			if err != nil {
-				return nil, err
-			}
-			newRules[i] = r
+			newRules[i] = RuleFromReq(ruleReq, subscription.Rules)
 		}
 		subscription.Rules = newRules
 	}

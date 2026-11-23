@@ -33,6 +33,8 @@ func TestConfigLoadRejectsInvalidReplacement(t *testing.T) {
 		"app: [",
 		"configVersion: 0.2.0\n",
 		"configVersion: 0.1.4\napp:\n  dnsProxy:\n    clientTTLCap: 123\n  clientRouting:\n    mode: unsupported\n",
+		"configVersion: 0.1.4\napp:\n  netfilter:\n    iptables:\n      chainPrefix: MT\n",
+		"configVersion: 0.1.4\napp:\n  netfilter:\n    ipset:\n      tablePrefix: ''\n",
 	} {
 		if err := os.WriteFile(path, []byte(text), 0600); err != nil {
 			t.Fatal(err)

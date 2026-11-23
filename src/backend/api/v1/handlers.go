@@ -786,11 +786,7 @@ func (h *Handler) CreateRule(w http.ResponseWriter, r *http.Request) {
 		}
 		enabled := groupWrapper.Enabled()
 
-		rule, e := RuleFromReq(req, groupWrapper.Model().Rules)
-		if e != nil {
-			status, errMsg = http.StatusBadRequest, e.Error()
-			return
-		}
+		rule := newRuleFromReq(req, intID.RandomID())
 		groupWrapper.Model().Rules = append(groupWrapper.Model().Rules, rule)
 		if enabled {
 			h.app.SyncAllGroups()
@@ -896,25 +892,20 @@ func (h *Handler) PutRule(w http.ResponseWriter, r *http.Request) {
 			status, errMsg = http.StatusNotFound, "group not exist"
 			return
 		}
-		var rule *models.Rule
-		for _, rl := range groupWrapper.Model().Rules {
-			if rl.ID == ruleID {
-				rule = rl
-				break
+		group := groupWrapper.Model()
+		for i, rule := range group.Rules {
+			if rule.ID != ruleID {
+				continue
 			}
-		}
-		if rule == nil {
-			status, errMsg = http.StatusNotFound, "rule not exist"
+			replacement := newRuleFromReq(req, ruleID)
+			group.Rules[i] = replacement
+			if groupWrapper.Enabled() {
+				h.app.SyncAllGroups()
+			}
+			resp = RespFromRule(replacement)
 			return
 		}
-		rule.Name = req.Name
-		rule.Type = req.Type
-		rule.Rule = req.Rule
-		rule.Enable = req.Enable
-		if groupWrapper.Enabled() {
-			h.app.SyncAllGroups()
-		}
-		resp = RespFromRule(rule)
+		status, errMsg = http.StatusNotFound, "rule not exist"
 	})
 	if status != 0 {
 		utils.WriteError(w, status, errMsg)

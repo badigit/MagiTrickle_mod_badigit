@@ -316,6 +316,10 @@ func (a *App) ImportConfig(cfg config.Config) error {
 		}
 	}
 
+	if err := netfilterTools.ValidatePrefixes(nextConfig.Netfilter.IPTables.ChainPrefix, nextConfig.Netfilter.IPSet.TablePrefix); err != nil {
+		return err
+	}
+
 	groups := *a.groups.Load()
 	if cfg.Groups != nil {
 		groupModels := make([]*models.Group, 0, len(*cfg.Groups))
