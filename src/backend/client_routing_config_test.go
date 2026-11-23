@@ -9,7 +9,7 @@ import (
 )
 
 func TestImportExportClientRouting(t *testing.T) {
-	a := New()
+	a := newApp()
 	mode := models.ClientRoutingModeExclude
 	values := []string{"192.168.1.25", "192.168.1.99/24", "2001:db8::1"}
 	if err := a.ImportConfig(config.Config{
@@ -36,11 +36,11 @@ func TestImportExportClientRouting(t *testing.T) {
 }
 
 func TestImportClientRoutingRejectsUnsupportedMode(t *testing.T) {
-	a := New()
+	a := newApp()
 	mode := "include"
 	if err := a.ImportConfig(config.Config{
 		ConfigVersion: "0.1.4",
-		App: &config.App{ClientRouting: &config.ClientRouting{Mode: &mode}},
+		App:           &config.App{ClientRouting: &config.ClientRouting{Mode: &mode}},
 	}); err == nil {
 		t.Fatal("expected unsupported mode error")
 	}

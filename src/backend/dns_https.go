@@ -38,7 +38,7 @@ func (a *App) processHTTPSRecord(httpsRecord *dns.HTTPS, idStr, clientAddrStr, n
 		Str("net", network).
 		Msg("processing HTTPS record")
 
-	ttlDuration := ipsetTTLFromRecord(httpsRecord.Hdr.Ttl, a.config.Netfilter.IPSet.AdditionalTTL)
+	ttlDuration := ipsetTTLFromRecord(httpsRecord.Hdr.Ttl, a.dnsAdditionalTTL())
 
 	// AliasMode (Priority == 0): SvcParams игнорируются (RFC 9460 §2.4.2), но
 	// сама связь owner→target — нет: follow-up A/AAAA-ответ придёт уже на
@@ -60,7 +60,7 @@ func (a *App) processHTTPSRecord(httpsRecord *dns.HTTPS, idStr, clientAddrStr, n
 		a.recordsCache.AddAlias(ownerName, targetName, ttlDuration)
 	}
 
-	dropAAAA := !a.config.DNSProxy.DisableDropAAAA
+	dropAAAA := !a.dnsConfig().DisableDropAAAA
 
 	for _, kv := range httpsRecord.Value {
 		switch hint := kv.(type) {

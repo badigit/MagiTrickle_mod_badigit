@@ -47,7 +47,10 @@ func setupHTTP(a *magitrickle.App, rootRouter chi.Router, errChan chan error) (*
 }
 
 func TestIntegration(t *testing.T) {
-	core := magitrickle.New()
+	core, err := magitrickle.New()
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	errChan := make(chan error, 1)
 

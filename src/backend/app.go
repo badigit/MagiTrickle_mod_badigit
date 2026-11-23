@@ -69,7 +69,8 @@ type App struct {
 
 	// cfgMu сериализует все мутации конфига (группы/правила/подписки) и
 	// защищает lock-free чтения датапаса. См. app_config_lock.go.
-	cfgMu sync.RWMutex
+	cfgMu        sync.RWMutex
+	configSaveMu sync.Mutex
 
 	clientRoutingMu sync.Mutex
 
@@ -118,7 +119,18 @@ type App struct {
 }
 
 // New создаёт новый экземпляр App
-func New() *App {
+func New() (*App, error) {
+	a := newApp()
+	if err := a.LoadConfig(); err != nil {
+		return nil, err
+	}
+	if err := a.LoadInterfaceConfig(); err != nil {
+		log.Error().Err(err).Msg("failed to load interface aliases")
+	}
+	return a, nil
+}
+
+func newApp() *App {
 	a := &App{
 		startedAt:        time.Now(),
 		config:           constant.DefaultAppConfig,
@@ -131,12 +143,6 @@ func New() *App {
 	a.subscriptionGroups.Store(&emptySubscriptionGroups)
 	emptySubscriptions := make([]*models.Subscription, 0)
 	a.subscriptions.Store(&emptySubscriptions)
-	if err := a.LoadConfig(); err != nil {
-		log.Error().Err(err).Msg("failed to load config file")
-	}
-	if err := a.LoadInterfaceConfig(); err != nil {
-		log.Error().Err(err).Msg("failed to load interface aliases")
-	}
 	a.domainTrie.Store(trie.New())
 	return a
 }
@@ -265,7 +271,9 @@ func (a *App) SearchDomainVerdict(domain string) (app.Group, string, bool) {
 
 // Config возвращает конфигурацию
 func (a *App) Config() models.AppConfig {
-	return a.config
+	a.cfgMu.RLock()
+	defer a.cfgMu.RUnlock()
+	return a.configSnapshotLocked()
 }
 
 // Groups возвращает список групп
@@ -307,13 +315,8 @@ func (a *App) AddGroup(groupModel *models.Group) error {
 			return ErrGroupIDConflict
 		}
 	}
-	// Проверка уникальности rule.ID внутри группы.
-	dup := make(map[[4]byte]struct{})
-	for _, rule := range groupModel.Rules {
-		if _, exists := dup[rule.ID]; exists {
-			return ErrRuleIDConflict
-		}
-		dup[rule.ID] = struct{}{}
+	if err := validateRuleIDs(groupModel.Rules); err != nil {
+		return err
 	}
 
 	grp, err := NewGroup(groupModel, a)
@@ -362,7 +365,7 @@ func (a *App) ListInterfaces() ([]net.Interface, error) {
 		return nil, fmt.Errorf("failed to get interfaces: %w", err)
 	}
 
-	if a.config.ShowAllInterfaces {
+	if a.Config().ShowAllInterfaces {
 		return interfaces, nil
 	}
 

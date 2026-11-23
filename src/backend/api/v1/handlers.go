@@ -1,6 +1,7 @@
 package v1
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -377,54 +378,47 @@ func (h *Handler) PutGroups(w http.ResponseWriter, r *http.Request) {
 		utils.WriteError(w, http.StatusBadRequest, "no groups in request")
 		return
 	}
-	var buildErr error
-	var addErrors []string
+	var applyErr error
 	var resp types.GroupsRes
 	h.app.WithConfigWrite(func() {
+		existingGroups := make(map[intID.ID]*models.Group)
 		for _, g := range h.app.Groups() {
-			_ = g.Disable()
+			existingGroups[g.Model().ID] = g.Model()
 		}
 		newGroups := make([]*models.Group, len(*req.Groups))
 		for i, gReq := range *req.Groups {
 			var existing *models.Group
-			for _, g := range h.app.Groups() {
-				if gReq.ID != nil && g.Model().ID == *gReq.ID {
-					existing = g.Model()
-					break
-				}
+			if gReq.ID != nil {
+				existing = existingGroups[*gReq.ID]
 			}
-			newGroups[i], buildErr = GroupFromReq(gReq, existing)
-			if buildErr != nil {
+			group, err := detachedGroupFromReq(gReq, existing)
+			if err != nil {
+				applyErr = fmt.Errorf("%w: %w", app.ErrInvalidGroups, err)
 				return
 			}
+			newGroups[i] = group
 		}
-		h.app.ClearGroups()
-		for _, grp := range newGroups {
-			if err := h.app.AddGroup(grp); err != nil {
-				log.Error().Err(err).Str("group", grp.Name).Msg("failed to add group")
-				addErrors = append(addErrors, fmt.Sprintf("%s: %v", grp.Name, err))
-			}
+		applyErr = h.app.ReplaceGroups(newGroups)
+		if applyErr == nil {
+			resp = RespFromGroups(newGroups, true)
 		}
-		h.app.SyncAllGroups()
-		resp = RespFromGroups(newGroups, true)
 	})
-	if buildErr != nil {
-		utils.WriteError(w, http.StatusBadRequest, buildErr.Error())
+	if applyErr != nil {
+		status := http.StatusInternalServerError
+		if errors.Is(applyErr, app.ErrInvalidGroups) {
+			status = http.StatusBadRequest
+		}
+		utils.WriteError(w, status, applyErr.Error())
 		return
-	}
-	if len(addErrors) > 0 {
-		utils.WriteJson(w, http.StatusOK, map[string]any{
-			"groups": resp.Groups,
-			"errors": addErrors,
-		})
-	} else {
-		utils.WriteJson(w, http.StatusOK, resp)
 	}
 	if r.URL.Query().Get("save") == "true" {
 		if err := h.app.SaveConfig(); err != nil {
 			log.Error().Err(err).Msg("failed to save config file")
+			utils.WriteError(w, http.StatusInternalServerError, "groups applied in memory, but failed to save config")
+			return
 		}
 	}
+	utils.WriteJson(w, http.StatusOK, resp)
 }
 
 // CreateGroup

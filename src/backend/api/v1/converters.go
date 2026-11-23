@@ -13,6 +13,29 @@ import (
 
 var colorRegExp = regexp2.MustCompile(`^#[0-9a-f]{6}$`, regexp2.IgnoreCase)
 
+func detachedGroupFromReq(req types.GroupReq, existing *models.Group) (*models.Group, error) {
+	if req.Rules != nil {
+		seen := make(map[intID.ID]struct{}, len(*req.Rules))
+		for _, rule := range *req.Rules {
+			if rule.ID != nil {
+				if _, duplicate := seen[*rule.ID]; duplicate {
+					return nil, fmt.Errorf("duplicate rule id %s", rule.ID.String())
+				}
+				seen[*rule.ID] = struct{}{}
+			}
+		}
+	}
+	if existing == nil {
+		return GroupFromReq(req, nil)
+	}
+	group := *existing
+	group.Rules = make([]*models.Rule, len(existing.Rules))
+	for i, rule := range existing.Rules {
+		group.Rules[i] = &models.Rule{ID: rule.ID, Name: rule.Name, Type: rule.Type, Rule: rule.Rule, Enable: rule.Enable}
+	}
+	return GroupFromReq(req, &group)
+}
+
 func GroupFromReq(req types.GroupReq, existing *models.Group) (*models.Group, error) {
 	var group *models.Group
 	if existing == nil {

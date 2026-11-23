@@ -27,12 +27,8 @@ func (a *App) AddSubscription(subscription *models.Subscription) error {
 		}
 	}
 
-	dup := make(map[[4]byte]struct{}, len(subscription.Rules))
-	for _, rule := range subscription.Rules {
-		if _, exists := dup[rule.ID]; exists {
-			return ErrRuleIDConflict
-		}
-		dup[rule.ID] = struct{}{}
+	if err := validateRuleIDs(subscription.Rules); err != nil {
+		return err
 	}
 
 	newSubs := make([]*models.Subscription, len(subs)+1)

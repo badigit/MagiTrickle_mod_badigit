@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 	"time"
@@ -11,10 +12,12 @@ import (
 	"magitrickle/config"
 	"magitrickle/constant"
 	"magitrickle/models"
+	"magitrickle/utils/intID"
 	"magitrickle/utils/netfilterTools"
 
 	"github.com/dlclark/regexp2"
 	"github.com/rs/zerolog/log"
+	"golang.org/x/sys/unix"
 	"gopkg.in/yaml.v3"
 )
 
@@ -45,7 +48,11 @@ func normalizeDirectPriority(mode string) string {
 }
 
 func (a *App) LoadConfig() error {
-	cfgFile, err := os.ReadFile(cfgFileLocation)
+	return a.loadConfigFile(cfgFileLocation)
+}
+
+func (a *App) loadConfigFile(path string) error {
+	cfgFile, err := os.ReadFile(path)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return nil
@@ -65,23 +72,52 @@ func (a *App) LoadConfig() error {
 }
 
 func (a *App) SaveConfig() error {
-	// Снимок конфига под RLock (ExportConfig читает g.Rules/подписки, которые
-	// писатели мутируют in-place). Маршал+запись на флеш — ВНЕ лока. ВАЖНО:
-	// НЕ вызывать SaveConfig под уже взятым cfgMu.Lock (RLock → дедлок) —
-	// все писатели зовут SaveConfig после выхода из WithConfigWrite.
-	var cfg config.Config
-	a.WithConfigRead(func() {
-		cfg = a.ExportConfig()
-	})
+	return a.saveConfigFile(cfgFileLocation)
+}
+
+func (a *App) saveConfigFile(path string) error {
+	// Serialize from snapshot through rename, without holding cfgMu during I/O.
+	a.configSaveMu.Lock()
+	defer a.configSaveMu.Unlock()
+	cfg := a.ExportConfig()
 	out, err := yaml.Marshal(cfg)
 	if err != nil {
 		return fmt.Errorf("failed to marshal config file: %w", err)
 	}
-	if err := os.MkdirAll(cfgFolderLocation, os.ModePerm); err != nil {
+	if err := os.MkdirAll(filepath.Dir(path), os.ModePerm); err != nil {
 		return fmt.Errorf("failed to create config folder: %w", err)
 	}
-	if err := os.WriteFile(cfgFileLocation, out, 0600); err != nil {
+	if err := writeConfigAtomic(path, out); err != nil {
 		return fmt.Errorf("failed to write config file: %w", err)
+	}
+	return nil
+}
+
+func writeConfigAtomic(path string, data []byte) error {
+	dir, err := os.Open(filepath.Dir(path))
+	if err != nil {
+		return err
+	}
+	defer dir.Close()
+	file, err := os.CreateTemp(dir.Name(), "."+filepath.Base(path)+".*.tmp")
+	if err != nil {
+		return err
+	}
+	defer os.Remove(file.Name())
+	_, err = file.Write(data)
+	if err == nil {
+		err = file.Sync()
+	}
+	if err := errors.Join(err, file.Close()); err != nil {
+		return err
+	}
+	if err := os.Rename(file.Name(), path); err != nil {
+		return err
+	}
+	if err := dir.Sync(); err != nil && !errors.Is(err, unix.EINVAL) && !errors.Is(err, unix.ENOTSUP) {
+		// The rename committed the new file. Report uncertainty in durability
+		// without asking callers to restore a different runtime config.
+		log.Warn().Err(err).Msg("failed to sync config directory after rename")
 	}
 	return nil
 }
@@ -117,9 +153,11 @@ func (a *App) SaveInterfaceConfig() error {
 }
 
 func (a *App) ImportConfig(cfg config.Config) error {
-	// ImportConfig вызывается и в рантайме (SIGHUP-релоад, main.go) → мутации групп/
-	// подписок должны идти под эксклюзивным cfgMu (mt-6q1). Не зовёт SaveConfig/
-	// searchDomain → реентранси-дедлока нет.
+	a.lifecycleMu.Lock()
+	defer a.lifecycleMu.Unlock()
+	if a.shuttingDown {
+		return errors.New("cannot reload config during shutdown")
+	}
 	a.clientRoutingMu.Lock()
 	defer a.clientRoutingMu.Unlock()
 	a.cfgMu.Lock()
@@ -129,48 +167,49 @@ func (a *App) ImportConfig(cfg config.Config) error {
 		return ErrConfigUnsupportedVersion
 	}
 
+	nextConfig := a.config
 	if cfg.App != nil {
 		if cfg.App.Enabled != nil {
-			a.config.Enabled = *cfg.App.Enabled
+			nextConfig.Enabled = *cfg.App.Enabled
 		}
 		if cfg.App.HTTPWeb != nil {
 			if cfg.App.HTTPWeb.Enabled != nil {
-				a.config.HTTPWeb.Enabled = *cfg.App.HTTPWeb.Enabled
+				nextConfig.HTTPWeb.Enabled = *cfg.App.HTTPWeb.Enabled
 			}
 			if cfg.App.HTTPWeb.Host != nil {
 				if cfg.App.HTTPWeb.Host.Address != nil {
-					a.config.HTTPWeb.Host.Address = *cfg.App.HTTPWeb.Host.Address
+					nextConfig.HTTPWeb.Host.Address = *cfg.App.HTTPWeb.Host.Address
 				}
 				if cfg.App.HTTPWeb.Host.Port != nil {
-					a.config.HTTPWeb.Host.Port = *cfg.App.HTTPWeb.Host.Port
+					nextConfig.HTTPWeb.Host.Port = *cfg.App.HTTPWeb.Host.Port
 				}
 			}
 			if cfg.App.HTTPWeb.Skin != nil {
-				a.config.HTTPWeb.Skin = *cfg.App.HTTPWeb.Skin
+				nextConfig.HTTPWeb.Skin = *cfg.App.HTTPWeb.Skin
 			}
 		}
 
 		if cfg.App.HTTPWeb != nil && cfg.App.HTTPWeb.Auth != nil {
 			if cfg.App.HTTPWeb.Auth.Enabled != nil {
-				a.config.HTTPWeb.Auth.Enabled = *cfg.App.HTTPWeb.Auth.Enabled
+				nextConfig.HTTPWeb.Auth.Enabled = *cfg.App.HTTPWeb.Auth.Enabled
 			}
 		}
 
 		if cfg.App.DNSProxy != nil {
 			if cfg.App.DNSProxy.Upstream != nil {
 				if cfg.App.DNSProxy.Upstream.Address != nil {
-					a.config.DNSProxy.Upstream.Address = *cfg.App.DNSProxy.Upstream.Address
+					nextConfig.DNSProxy.Upstream.Address = *cfg.App.DNSProxy.Upstream.Address
 				}
 				if cfg.App.DNSProxy.Upstream.Port != nil {
-					a.config.DNSProxy.Upstream.Port = *cfg.App.DNSProxy.Upstream.Port
+					nextConfig.DNSProxy.Upstream.Port = *cfg.App.DNSProxy.Upstream.Port
 				}
 			}
 			if cfg.App.DNSProxy.Host != nil {
 				if cfg.App.DNSProxy.Host.Address != nil {
-					a.config.DNSProxy.Host.Address = *cfg.App.DNSProxy.Host.Address
+					nextConfig.DNSProxy.Host.Address = *cfg.App.DNSProxy.Host.Address
 				}
 				if cfg.App.DNSProxy.Host.Port != nil {
-					a.config.DNSProxy.Host.Port = *cfg.App.DNSProxy.Host.Port
+					nextConfig.DNSProxy.Host.Port = *cfg.App.DNSProxy.Host.Port
 				}
 			}
 			if cfg.App.DNSProxy.FallbackUpstream != nil {
@@ -182,44 +221,44 @@ func (a *App) ImportConfig(cfg config.Config) error {
 					fb.Port = *cfg.App.DNSProxy.FallbackUpstream.Port
 				}
 				if fb.Address != "" && fb.Port != 0 {
-					a.config.DNSProxy.FallbackUpstream = &fb
+					nextConfig.DNSProxy.FallbackUpstream = &fb
 				}
 			}
 			if cfg.App.DNSProxy.DisableRemap53 != nil {
-				a.config.DNSProxy.DisableRemap53 = *cfg.App.DNSProxy.DisableRemap53
+				nextConfig.DNSProxy.DisableRemap53 = *cfg.App.DNSProxy.DisableRemap53
 			}
 			if cfg.App.DNSProxy.DisableFakePTR != nil {
-				a.config.DNSProxy.DisableFakePTR = *cfg.App.DNSProxy.DisableFakePTR
+				nextConfig.DNSProxy.DisableFakePTR = *cfg.App.DNSProxy.DisableFakePTR
 			}
 			if cfg.App.DNSProxy.DisableDropAAAA != nil {
-				a.config.DNSProxy.DisableDropAAAA = *cfg.App.DNSProxy.DisableDropAAAA
+				nextConfig.DNSProxy.DisableDropAAAA = *cfg.App.DNSProxy.DisableDropAAAA
 			}
 			if cfg.App.DNSProxy.MaxIdleConns != nil {
-				a.config.DNSProxy.MaxIdleConns = *cfg.App.DNSProxy.MaxIdleConns
+				nextConfig.DNSProxy.MaxIdleConns = *cfg.App.DNSProxy.MaxIdleConns
 			}
 			if cfg.App.DNSProxy.MaxConcurrent != nil {
-				a.config.DNSProxy.MaxConcurrent = *cfg.App.DNSProxy.MaxConcurrent
+				nextConfig.DNSProxy.MaxConcurrent = *cfg.App.DNSProxy.MaxConcurrent
 			}
 			if cfg.App.DNSProxy.Timeout != nil {
-				a.config.DNSProxy.Timeout = time.Duration(*cfg.App.DNSProxy.Timeout) * time.Millisecond
+				nextConfig.DNSProxy.Timeout = time.Duration(*cfg.App.DNSProxy.Timeout) * time.Millisecond
 			}
 			if cfg.App.DNSProxy.ClientTTLCap != nil {
-				a.config.DNSProxy.ClientTTLCap = *cfg.App.DNSProxy.ClientTTLCap
+				nextConfig.DNSProxy.ClientTTLCap = *cfg.App.DNSProxy.ClientTTLCap
 			}
 			if cfg.App.DNSProxy.PersistCache != nil {
-				a.config.DNSProxy.PersistCache = *cfg.App.DNSProxy.PersistCache
+				nextConfig.DNSProxy.PersistCache = *cfg.App.DNSProxy.PersistCache
 			}
 		}
 
 		if cfg.App.ClientRouting != nil {
-			mode := a.config.ClientRouting.Mode
+			mode := nextConfig.ClientRouting.Mode
 			if cfg.App.ClientRouting.Mode != nil {
 				mode = *cfg.App.ClientRouting.Mode
 			}
 			if mode != models.ClientRoutingModeExclude {
 				return fmt.Errorf("unsupported client routing mode %q", mode)
 			}
-			sourceNetworks := a.config.ClientRouting.SourceNetworks
+			sourceNetworks := nextConfig.ClientRouting.SourceNetworks
 			if cfg.App.ClientRouting.SourceNetworks != nil {
 				sourceNetworks = *cfg.App.ClientRouting.SourceNetworks
 			}
@@ -227,13 +266,7 @@ func (a *App) ImportConfig(cfg config.Config) error {
 			if err != nil {
 				return err
 			}
-			if a.nfHelper != nil {
-				normalized, err = a.nfHelper.UpdateClientBypass(normalized)
-				if err != nil {
-					return fmt.Errorf("failed to update client bypass: %w", err)
-				}
-			}
-			a.config.ClientRouting = models.AppConfigClientRouting{
+			nextConfig.ClientRouting = models.AppConfigClientRouting{
 				Mode:           mode,
 				SourceNetworks: normalized,
 			}
@@ -242,152 +275,163 @@ func (a *App) ImportConfig(cfg config.Config) error {
 		if cfg.App.Netfilter != nil {
 			if cfg.App.Netfilter.IPTables != nil {
 				if cfg.App.Netfilter.IPTables.ChainPrefix != nil {
-					a.config.Netfilter.IPTables.ChainPrefix = *cfg.App.Netfilter.IPTables.ChainPrefix
+					nextConfig.Netfilter.IPTables.ChainPrefix = *cfg.App.Netfilter.IPTables.ChainPrefix
 				}
 			}
 			if cfg.App.Netfilter.IPSet != nil {
 				if cfg.App.Netfilter.IPSet.TablePrefix != nil {
-					a.config.Netfilter.IPSet.TablePrefix = *cfg.App.Netfilter.IPSet.TablePrefix
+					nextConfig.Netfilter.IPSet.TablePrefix = *cfg.App.Netfilter.IPSet.TablePrefix
 				}
 				if cfg.App.Netfilter.IPSet.AdditionalTTL != nil {
-					a.config.Netfilter.IPSet.AdditionalTTL = *cfg.App.Netfilter.IPSet.AdditionalTTL
+					nextConfig.Netfilter.IPSet.AdditionalTTL = *cfg.App.Netfilter.IPSet.AdditionalTTL
 				}
 			}
 			if cfg.App.Netfilter.DisableIPv4 != nil {
-				a.config.Netfilter.DisableIPv4 = *cfg.App.Netfilter.DisableIPv4
+				nextConfig.Netfilter.DisableIPv4 = *cfg.App.Netfilter.DisableIPv4
 			}
 			if cfg.App.Netfilter.DisableIPv6 != nil {
-				a.config.Netfilter.DisableIPv6 = *cfg.App.Netfilter.DisableIPv6
+				nextConfig.Netfilter.DisableIPv6 = *cfg.App.Netfilter.DisableIPv6
 			}
 			if cfg.App.Netfilter.StartMarkTableIndex != nil {
-				a.config.Netfilter.StartMarkTableIndex = *cfg.App.Netfilter.StartMarkTableIndex
+				nextConfig.Netfilter.StartMarkTableIndex = *cfg.App.Netfilter.StartMarkTableIndex
 			}
 			if cfg.App.Netfilter.TProxyPort != nil {
-				a.config.Netfilter.TProxyPort = *cfg.App.Netfilter.TProxyPort
+				nextConfig.Netfilter.TProxyPort = *cfg.App.Netfilter.TProxyPort
 			}
 			if cfg.App.Netfilter.DirectPriority != nil {
-				a.config.Netfilter.DirectPriority = normalizeDirectPriority(*cfg.App.Netfilter.DirectPriority)
+				nextConfig.Netfilter.DirectPriority = normalizeDirectPriority(*cfg.App.Netfilter.DirectPriority)
 			}
 		}
 
 		if cfg.App.Link != nil {
-			a.config.Link = *cfg.App.Link
+			nextConfig.Link = slices.Clone(*cfg.App.Link)
 		}
 
 		if cfg.App.ShowAllInterfaces != nil {
-			a.config.ShowAllInterfaces = *cfg.App.ShowAllInterfaces
+			nextConfig.ShowAllInterfaces = *cfg.App.ShowAllInterfaces
 		}
 
 		if cfg.App.LogLevel != nil {
-			a.config.LogLevel = *cfg.App.LogLevel
+			nextConfig.LogLevel = *cfg.App.LogLevel
 		}
 	}
 
+	groups := *a.groups.Load()
 	if cfg.Groups != nil {
-		// отключаем старые группы и очищаем срез
-		for _, group := range *a.groups.Load() {
-			_ = group.Disable()
-		}
-		emptyGroups := make([]*Group, 0)
-		a.groups.Store(&emptyGroups)
-
-		// импортируем новые группы
+		groupModels := make([]*models.Group, 0, len(*cfg.Groups))
 		for _, group := range *cfg.Groups {
-			rules := make([]*models.Rule, len(group.Rules))
-			for idx, rule := range group.Rules {
-				rules[idx] = &models.Rule{
-					ID:     rule.ID,
-					Name:   rule.Name,
-					Type:   rule.Type,
-					Rule:   rule.Rule,
-					Enable: rule.Enable,
-				}
-			}
 			if match, _ := colorRegExp.MatchString(group.Color); !match {
 				group.Color = "#ffffff"
 			} else {
 				group.Color = strings.ToLower(group.Color)
 			}
-			enable := true
-			if group.Enable != nil {
-				enable = *group.Enable
-			}
-			err := a.AddGroup(&models.Group{
-				ID:        group.ID,
-				Name:      group.Name,
-				Color:     group.Color,
-				Interface: group.Interface,
-				Enable:    enable,
-				Rules:     rules,
-			})
-			if err != nil {
-				return err
-			}
+			groupModels = append(groupModels, newGroupModel(group))
+		}
+		var err error
+		groups, err = a.prepareGroups(groupModels)
+		if err != nil {
+			return err
 		}
 	}
 
+	subscriptions := *a.subscriptions.Load()
+	subscriptionGroups := *a.subscriptionGroups.Load()
 	if cfg.Subscriptions != nil {
-		a.ClearSubscriptions()
-
+		subscriptions = make([]*models.Subscription, 0, len(*cfg.Subscriptions))
+		seen := make(map[intID.ID]struct{}, len(*cfg.Subscriptions))
 		for _, subscription := range *cfg.Subscriptions {
-			rules := make([]*models.Rule, len(subscription.Rules))
-			for idx, rule := range subscription.Rules {
-				rules[idx] = &models.Rule{
-					ID:     rule.ID,
-					Name:   rule.Name,
-					Type:   rule.Type,
-					Rule:   rule.Rule,
-					Enable: rule.Enable,
-				}
+			model := newSubscriptionModel(subscription)
+			if _, duplicate := seen[model.ID]; duplicate {
+				return ErrSubscriptionIDConflict
 			}
-
-			interval := int64(86400)
-			if subscription.Interval != nil && *subscription.Interval > 0 {
-				interval = *subscription.Interval
-			}
-
-			lastUpdate := int64(0)
-			if subscription.LastUpdate != nil {
-				lastUpdate = *subscription.LastUpdate
-			}
-
-			enable := true
-			if subscription.Enable != nil {
-				enable = *subscription.Enable
-			}
-
-			if err := a.AddSubscription(&models.Subscription{
-				ID:         subscription.ID,
-				Name:       subscription.Name,
-				Interface:  subscription.Interface,
-				Enable:     enable,
-				URL:        subscription.URL,
-				LastUpdate: lastUpdate,
-				Interval:   interval,
-				Rules:      rules,
-			}); err != nil {
+			seen[model.ID] = struct{}{}
+			if err := validateRuleIDs(model.Rules); err != nil {
 				return err
 			}
+			subscriptions = append(subscriptions, model)
+		}
+		var err error
+		subscriptionGroups, err = a.prepareSubscriptionGroups(subscriptions)
+		if err != nil {
+			return err
 		}
 	}
 
-	if err := a.RebuildSubscriptionGroups(); err != nil {
-		return fmt.Errorf("failed to rebuild subscription groups: %w", err)
-	}
+	return a.WithRoutingMutation(func() error {
+		updateBypass := func() error {
+			if cfg.App == nil || cfg.App.ClientRouting == nil || a.nfHelper == nil {
+				return nil
+			}
+			_, err := a.nfHelper.UpdateClientBypass(nextConfig.ClientRouting.SourceNetworks)
+			if err != nil {
+				return fmt.Errorf("failed to update client bypass: %w", err)
+			}
+			return nil
+		}
+		if cfg.Groups != nil || cfg.Subscriptions != nil {
+			next := slices.Concat(groups, subscriptionGroups)
+			if err := a.replaceGroupRoutes(next, nextConfig.Netfilter, updateBypass); err != nil {
+				return err
+			}
+		} else if err := updateBypass(); err != nil {
+			return err
+		}
 
-	return nil
+		a.config = nextConfig
+		a.groups.Store(&groups)
+		a.subscriptions.Store(&subscriptions)
+		a.subscriptionGroups.Store(&subscriptionGroups)
+		a.RebuildTrie()
+		return nil
+	})
+}
+
+func newGroupModel(group config.Group) *models.Group {
+	return &models.Group{
+		ID: group.ID, Name: group.Name, Color: group.Color, Interface: group.Interface,
+		Enable: group.Enable == nil || *group.Enable,
+		Rules:  importRules(group.Rules),
+	}
+}
+
+func newSubscriptionModel(subscription config.Subscription) *models.Subscription {
+	interval := int64(86400)
+	if subscription.Interval != nil && *subscription.Interval > 0 {
+		interval = *subscription.Interval
+	}
+	lastUpdate := int64(0)
+	if subscription.LastUpdate != nil {
+		lastUpdate = *subscription.LastUpdate
+	}
+	return &models.Subscription{
+		ID: subscription.ID, Name: subscription.Name, Interface: subscription.Interface,
+		Enable: subscription.Enable == nil || *subscription.Enable, URL: subscription.URL,
+		Interval: interval, LastUpdate: lastUpdate, Rules: importRules(subscription.Rules),
+	}
+}
+
+func importRules(rules []config.Rule) []*models.Rule {
+	result := make([]*models.Rule, len(rules))
+	for i, rule := range rules {
+		result[i] = &models.Rule{ID: rule.ID, Name: rule.Name, Type: rule.Type, Rule: rule.Rule, Enable: rule.Enable}
+	}
+	return result
 }
 
 func (a *App) ExportConfig() config.Config {
+	a.cfgMu.RLock()
+	defer a.cfgMu.RUnlock()
+	settings := a.configSnapshotLocked()
 	gs := *a.groups.Load()
 	groups := make([]config.Group, len(gs))
 	for idx, group := range gs {
+		enabled := group.Group.Enable
 		groupCfg := config.Group{
 			ID:        group.ID,
 			Name:      group.Name,
 			Color:     group.Color,
 			Interface: group.Interface,
-			Enable:    &group.Group.Enable,
+			Enable:    &enabled,
 			Rules:     make([]config.Rule, len(group.Rules)),
 		}
 		for idx, rule := range group.Rules {
@@ -405,14 +449,15 @@ func (a *App) ExportConfig() config.Config {
 	ss := *a.subscriptions.Load()
 	subscriptions := make([]config.Subscription, len(ss))
 	for idx, subscription := range ss {
+		enabled, lastUpdate, interval := subscription.Enable, subscription.LastUpdate, subscription.Interval
 		subscriptionCfg := config.Subscription{
 			ID:         subscription.ID,
 			Name:       subscription.Name,
 			Interface:  subscription.Interface,
-			Enable:     &subscription.Enable,
+			Enable:     &enabled,
 			URL:        subscription.URL,
-			LastUpdate: &subscription.LastUpdate,
-			Interval:   &subscription.Interval,
+			LastUpdate: &lastUpdate,
+			Interval:   &interval,
 			Rules:      make([]config.Rule, len(subscription.Rules)),
 		}
 		for ruleIdx, rule := range subscription.Rules {
@@ -430,71 +475,80 @@ func (a *App) ExportConfig() config.Config {
 	return config.Config{
 		ConfigVersion: "0.1.4",
 		App: &config.App{
-			Enabled: &a.config.Enabled,
+			Enabled: &settings.Enabled,
 			HTTPWeb: &config.HTTPWeb{
-				Enabled: &a.config.HTTPWeb.Enabled,
+				Enabled: &settings.HTTPWeb.Enabled,
 				Auth: &config.Auth{
-					Enabled: &a.config.HTTPWeb.Auth.Enabled,
+					Enabled: &settings.HTTPWeb.Auth.Enabled,
 				},
 				Host: &config.HTTPWebServer{
-					Address: &a.config.HTTPWeb.Host.Address,
-					Port:    &a.config.HTTPWeb.Host.Port,
+					Address: &settings.HTTPWeb.Host.Address,
+					Port:    &settings.HTTPWeb.Host.Port,
 				},
-				Skin: &a.config.HTTPWeb.Skin,
+				Skin: &settings.HTTPWeb.Skin,
 			},
 			DNSProxy: &config.DNSProxy{
 				Host: &config.DNSProxyServer{
-					Address: &a.config.DNSProxy.Host.Address,
-					Port:    &a.config.DNSProxy.Host.Port,
+					Address: &settings.DNSProxy.Host.Address,
+					Port:    &settings.DNSProxy.Host.Port,
 				},
 				Upstream: &config.DNSProxyServer{
-					Address: &a.config.DNSProxy.Upstream.Address,
-					Port:    &a.config.DNSProxy.Upstream.Port,
+					Address: &settings.DNSProxy.Upstream.Address,
+					Port:    &settings.DNSProxy.Upstream.Port,
 				},
 				FallbackUpstream: func() *config.DNSProxyServer {
-					if a.config.DNSProxy.FallbackUpstream == nil {
+					if settings.DNSProxy.FallbackUpstream == nil {
 						return nil
 					}
 					return &config.DNSProxyServer{
-						Address: &a.config.DNSProxy.FallbackUpstream.Address,
-						Port:    &a.config.DNSProxy.FallbackUpstream.Port,
+						Address: &settings.DNSProxy.FallbackUpstream.Address,
+						Port:    &settings.DNSProxy.FallbackUpstream.Port,
 					}
 				}(),
-				DisableRemap53:  &a.config.DNSProxy.DisableRemap53,
-				DisableFakePTR:  &a.config.DNSProxy.DisableFakePTR,
-				DisableDropAAAA: &a.config.DNSProxy.DisableDropAAAA,
-				MaxIdleConns:    &a.config.DNSProxy.MaxIdleConns,
-				MaxConcurrent:   &a.config.DNSProxy.MaxConcurrent,
-				Timeout:         func(u uint) *uint { return &u }(uint(a.config.DNSProxy.Timeout.Milliseconds())),
-				ClientTTLCap:    &a.config.DNSProxy.ClientTTLCap,
-				PersistCache:    &a.config.DNSProxy.PersistCache,
+				DisableRemap53:  &settings.DNSProxy.DisableRemap53,
+				DisableFakePTR:  &settings.DNSProxy.DisableFakePTR,
+				DisableDropAAAA: &settings.DNSProxy.DisableDropAAAA,
+				MaxIdleConns:    &settings.DNSProxy.MaxIdleConns,
+				MaxConcurrent:   &settings.DNSProxy.MaxConcurrent,
+				Timeout:         func(u uint) *uint { return &u }(uint(settings.DNSProxy.Timeout.Milliseconds())),
+				ClientTTLCap:    &settings.DNSProxy.ClientTTLCap,
+				PersistCache:    &settings.DNSProxy.PersistCache,
 			},
 			ClientRouting: &config.ClientRouting{
-				Mode: &a.config.ClientRouting.Mode,
-				SourceNetworks: func() *[]string {
-					values := slices.Clone(a.config.ClientRouting.SourceNetworks)
-					return &values
-				}(),
+				Mode:           &settings.ClientRouting.Mode,
+				SourceNetworks: &settings.ClientRouting.SourceNetworks,
 			},
 			Netfilter: &config.Netfilter{
 				IPTables: &config.IPTables{
-					ChainPrefix: &a.config.Netfilter.IPTables.ChainPrefix,
+					ChainPrefix: &settings.Netfilter.IPTables.ChainPrefix,
 				},
 				IPSet: &config.IPSet{
-					TablePrefix:   &a.config.Netfilter.IPSet.TablePrefix,
-					AdditionalTTL: &a.config.Netfilter.IPSet.AdditionalTTL,
+					TablePrefix:   &settings.Netfilter.IPSet.TablePrefix,
+					AdditionalTTL: &settings.Netfilter.IPSet.AdditionalTTL,
 				},
-				DisableIPv4:         &a.config.Netfilter.DisableIPv4,
-				DisableIPv6:         &a.config.Netfilter.DisableIPv6,
-				StartMarkTableIndex: &a.config.Netfilter.StartMarkTableIndex,
-				TProxyPort:          &a.config.Netfilter.TProxyPort,
-				DirectPriority:      &a.config.Netfilter.DirectPriority,
+				DisableIPv4:         &settings.Netfilter.DisableIPv4,
+				DisableIPv6:         &settings.Netfilter.DisableIPv6,
+				StartMarkTableIndex: &settings.Netfilter.StartMarkTableIndex,
+				TProxyPort:          &settings.Netfilter.TProxyPort,
+				DirectPriority:      &settings.Netfilter.DirectPriority,
 			},
-			Link:              &a.config.Link,
-			ShowAllInterfaces: &a.config.ShowAllInterfaces,
-			LogLevel:          &a.config.LogLevel,
+			Link:              &settings.Link,
+			ShowAllInterfaces: &settings.ShowAllInterfaces,
+			LogLevel:          &settings.LogLevel,
 		},
 		Groups:        &groups,
 		Subscriptions: &subscriptions,
 	}
+}
+
+// configSnapshotLocked copies mutable fields while cfgMu is held.
+func (a *App) configSnapshotLocked() models.AppConfig {
+	settings := a.config
+	settings.Link = slices.Clone(settings.Link)
+	settings.ClientRouting.SourceNetworks = slices.Clone(settings.ClientRouting.SourceNetworks)
+	if fallback := settings.DNSProxy.FallbackUpstream; fallback != nil {
+		copy := *fallback
+		settings.DNSProxy.FallbackUpstream = &copy
+	}
+	return settings
 }

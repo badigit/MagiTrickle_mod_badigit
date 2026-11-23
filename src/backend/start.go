@@ -31,6 +31,16 @@ func (a *App) Start(ctx context.Context) (err error) {
 	}
 	defer a.enabled.Store(false)
 
+	// Keep live reload out of startup until the netfilter helper and
+	// listeners have been initialized.
+	a.lifecycleMu.Lock()
+	starting := true
+	defer func() {
+		if starting {
+			a.lifecycleMu.Unlock()
+		}
+	}()
+
 	defer func() {
 		if r := recover(); r != nil {
 			fmt.Fprintf(os.Stderr, "panic: %v\n%s\n", r, debug.Stack())
@@ -115,7 +125,9 @@ func (a *App) Start(ctx context.Context) (err error) {
 	if err != nil {
 		return fmt.Errorf("failed to prepare client bypass: %w", err)
 	}
-	a.config.ClientRouting.SourceNetworks = normalizedBypass
+	a.WithConfigWrite(func() {
+		a.config.ClientRouting.SourceNetworks = normalizedBypass
+	})
 	// Registered before bringDownRouting's defer below, so LIFO teardown first
 	// removes all iptables references and only then destroys the ipsets.
 	defer func() {
@@ -160,23 +172,9 @@ func (a *App) Start(ctx context.Context) (err error) {
 	var httpServer, unixServer *http.Server
 	var interfaceAddrs []netlink.Addr
 
-	// lifecycleMu — тот же лок, что держит SetEnabled. Секция расширена НАЗАД
-	// относительно старого варианта: сокеты (HTTP и unix) открываются здесь
-	// же, и с этого момента снаружи уже может прийти SetEnabled, который
-	// гоняется за a.dnsOverrider и routingGroups() — а они собираются НИЖЕ,
-	// вплоть до bringUpRouting. Не покрой лок это окно — SetEnabled(true),
-	// пришедший между открытием сокета и сборкой групп, мог бы выставить
-	// routingActive=true раньше времени, и собственный bringUpRouting ниже
-	// стал бы no-op по CAS: DNS-ремап 53 не установился бы вовсе.
-	//
-	// Участок обёрнут в IIFE с defer Unlock, чтобы лок освобождался на всех
-	// путях выхода — включая панику и ранние return err ниже (LinkByName,
-	// RebuildSubscriptionGroups, bringUpRouting). IIFE возвращает ошибку,
-	// вызывающий код пробрасывает её из Start.
+	// Keep lifecycleMu until sockets, groups and DNS remap are all ready.
+	// The IIFE keeps partially opened servers available for cleanup on error.
 	lifecycleErr := func() error {
-		a.lifecycleMu.Lock()
-		defer a.lifecycleMu.Unlock()
-
 		var err error
 		httpServer, err = api.SetupHTTP(a, errChan)
 		if err != nil {
@@ -208,7 +206,11 @@ func (a *App) Start(ctx context.Context) (err error) {
 			a.dnsOverrider = a.nfHelper.PortRemap("DNSOR", 53, a.config.DNSProxy.Host.Port, interfaceAddrs)
 		}
 
-		if err := a.RebuildSubscriptionGroups(); err != nil {
+		var rebuildErr error
+		a.WithConfigWrite(func() {
+			rebuildErr = a.RebuildSubscriptionGroups()
+		})
+		if err := rebuildErr; err != nil {
 			return fmt.Errorf("failed to prepare subscription groups: %w", err)
 		}
 
@@ -225,6 +227,8 @@ func (a *App) Start(ctx context.Context) (err error) {
 		}
 		return nil
 	}()
+	a.lifecycleMu.Unlock()
+	starting = false
 
 	// defer Close регистрируем СРАЗУ после вызова IIFE и ДО проверки ошибки:
 	// сервер должен закрыться и при успехе (обычный teardown ниже), и при
@@ -264,7 +268,7 @@ func (a *App) Start(ctx context.Context) (err error) {
 		_ = a.withRoutingMutationUnderConfig(a.bringDownRouting)
 	}()
 
-	if a.config.DNSProxy.PersistCache {
+	if a.dnsConfig().PersistCache {
 		// Финальный синхронный флеш снапшота — ЗДЕСЬ, а не рядом со StartPersist:
 		// defer'ы идут LIFO, поэтому эта регистрация (после bringDownRouting)
 		// выполняется ПЕРЕД ним, пока группы ещё включены. Иначе isPersistableDomain

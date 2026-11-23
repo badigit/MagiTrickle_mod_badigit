@@ -182,7 +182,7 @@ func (g *Group) ListIPv6Subnets() (map[netfilterTools.IPv6Subnet]netfilterTools.
 	return g.listIPv6Subnets()
 }
 
-func (g *Group) enable() error {
+func (g *Group) enable(netfilter models.AppConfigNetfilter) error {
 	if !g.enabled.CompareAndSwap(false, true) {
 		return nil
 	}
@@ -195,7 +195,7 @@ func (g *Group) enable() error {
 
 	switch g.Group.EffectiveRouteMode() {
 	case models.RouteModeTProxy:
-		ipsetToTProxy := g.app.nfHelper.IPSetToTProxy(g.runtimeID, g.app.config.Netfilter.TProxyPort, ipset, g.app.config.Netfilter.IPSet.AdditionalTTL)
+		ipsetToTProxy := g.app.nfHelper.IPSetToTProxy(g.runtimeID, netfilter.TProxyPort, ipset, netfilter.IPSet.AdditionalTTL)
 		if err := ipsetToTProxy.ClearIfDisabled(); err != nil {
 			return fmt.Errorf("failed to clear iptables: %w", err)
 		}
@@ -231,11 +231,14 @@ func (g *Group) enable() error {
 }
 
 func (g *Group) Enable() error {
+	return g.enableWithConfig(g.app.config.Netfilter)
+}
+
+func (g *Group) enableWithConfig(netfilter models.AppConfigNetfilter) error {
 	g.locker.Lock()
 	defer g.locker.Unlock()
-	if err := g.enable(); err != nil {
-		_ = g.disable()
-		return err
+	if err := g.enable(netfilter); err != nil {
+		return errors.Join(err, g.disable())
 	}
 	return nil
 }
@@ -360,6 +363,7 @@ func (g *Group) sync() error {
 	if err != nil {
 		return fmt.Errorf("failed to get old ipset list: %w", err)
 	}
+	var syncErrors []error
 	for subnet, newTTL := range newIPv4SubnetList {
 		if oldTTL, ok := oldIPv4SubnetList[subnet]; ok {
 			if oldTTL == nil || (newTTL != nil && *newTTL < *oldTTL) {
@@ -368,6 +372,7 @@ func (g *Group) sync() error {
 		}
 
 		if err := g.addIPv4Subnet(subnet, newTTL); err != nil {
+			syncErrors = append(syncErrors, fmt.Errorf("add %s: %w", subnet.String(), err))
 			log.Error().
 				Err(err).
 				Str("subnet", subnet.String()).
@@ -384,6 +389,7 @@ func (g *Group) sync() error {
 		}
 
 		if err := g.delIPv4Subnet(subnet); err != nil {
+			syncErrors = append(syncErrors, fmt.Errorf("delete %s: %w", subnet.String(), err))
 			log.Error().
 				Err(err).
 				Str("subnet", subnet.String()).
@@ -397,7 +403,7 @@ func (g *Group) sync() error {
 
 	oldIPv6SubnetList, err := g.listIPv6Subnets()
 	if err != nil {
-		return fmt.Errorf("failed to get old ipset list: %w", err)
+		return errors.Join(append(syncErrors, fmt.Errorf("failed to get old ipset list: %w", err))...)
 	}
 	for subnet, newTTL := range newIPv6SubnetList {
 		if oldTTL, ok := oldIPv6SubnetList[subnet]; ok {
@@ -407,6 +413,7 @@ func (g *Group) sync() error {
 		}
 
 		if err := g.addIPv6Subnet(subnet, newTTL); err != nil {
+			syncErrors = append(syncErrors, fmt.Errorf("add %s: %w", subnet.String(), err))
 			log.Error().
 				Err(err).
 				Str("subnet", subnet.String()).
@@ -423,6 +430,7 @@ func (g *Group) sync() error {
 		}
 
 		if err := g.delIPv6Subnet(subnet); err != nil {
+			syncErrors = append(syncErrors, fmt.Errorf("delete %s: %w", subnet.String(), err))
 			log.Error().
 				Err(err).
 				Str("subnet", subnet.String()).
@@ -434,7 +442,7 @@ func (g *Group) sync() error {
 		}
 	}
 
-	return nil
+	return errors.Join(syncErrors...)
 }
 
 // desiredSubnets собирает целевое состояние ipset-сетов группы на момент now:
