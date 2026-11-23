@@ -381,6 +381,26 @@ func (h *Handler) PutGroups(w http.ResponseWriter, r *http.Request) {
 	var addErrors []string
 	var resp types.GroupsRes
 	h.app.WithConfigWrite(func() {
+		groups := h.app.Groups()
+		if len(groups) == len(*req.Groups) {
+			metadataOnly := true
+			for i, groupReq := range *req.Groups {
+				old := groups[i].Model()
+				if groupReq.ID == nil || *groupReq.ID != old.ID || !groupMetadataOnly(groupReq, old) {
+					metadataOnly = false
+					break
+				}
+			}
+			if metadataOnly {
+				updated := make([]*models.Group, len(groups))
+				for i, groupReq := range *req.Groups {
+					updated[i] = groups[i].Model()
+					applyGroupMetadata(groupReq, updated[i])
+				}
+				resp = RespFromGroups(updated, true)
+				return
+			}
+		}
 		for _, g := range h.app.Groups() {
 			_ = g.Disable()
 		}
@@ -542,6 +562,12 @@ func (h *Handler) PutGroup(w http.ResponseWriter, r *http.Request) {
 		groupWrapper, ok := h.app.GroupByID(groupID)
 		if !ok {
 			status, errMsg = http.StatusNotFound, "group not exist"
+			return
+		}
+		model := groupWrapper.Model()
+		if groupMetadataOnly(req, model) {
+			applyGroupMetadata(req, model)
+			resp = RespFromGroup(model, true)
 			return
 		}
 		enabled := groupWrapper.Enabled()

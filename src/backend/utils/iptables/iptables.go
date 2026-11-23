@@ -33,6 +33,8 @@ type IPTables struct {
 
 	// commitMu сериализует коммиты между собой. См. CommitContext.
 	commitMu sync.Mutex
+	// A positional restore may have reached the kernel even on cancellation.
+	pendingJumpChecks map[chainLocation]patchRecovery // guarded by commitMu
 
 	// deferred включает батч-режим: Commit() не ходит в ядро, а лишь копит
 	// правила в rules. Нужен для массовых операций (teardown/bring-up всех
@@ -73,7 +75,9 @@ func (ipt *IPTables) RegisterChainPatch(table, chainName string) error {
 	if _, ok := ipt.rules[table]; !ok {
 		ipt.rules[table] = make(map[string]chain)
 	}
-	ipt.rules[table][chainName] = &chainPatch{}
+	ipt.rules[table][chainName] = &chainPatch{
+		recoverOrder: chainName == "PREROUTING" && (table == "mangle" || table == "nat"),
+	}
 	return nil
 }
 
@@ -281,7 +285,12 @@ func (ipt *IPTables) CommitContext(ctx context.Context) (err error) {
 	if err != nil {
 		return err
 	}
+	if err := ipt.checkJumpRecoveries(ctx, curRules, false); err != nil {
+		return err
+	}
 
+	var readback map[chainLocation]patchRecovery
+	var observations []patchRecovery
 	for tableName, table := range ipt.rules {
 		curTable := curRules[tableName]
 
@@ -295,12 +304,30 @@ func (ipt *IPTables) CommitContext(ctx context.Context) (err error) {
 			if curTable[chainName] != nil {
 				curChain = curTable[chainName]
 			}
-			commands, priority, err := chain.Compile(chainNameBytes, curChain)
-			if err != nil {
-				return err
-			}
-			if commandsPrioritized[int8(priority)] == nil {
-				commandsPrioritized[int8(priority)] = make([]command, 0)
+			var commands []command
+			var order priority
+			if patch, ok := chain.(*chainPatch); ok && patch.recoverOrder {
+				var plan patchRecovery
+				commands, plan = patch.planRecovery(tableName, chainNameBytes, curChain)
+				if plan.observe {
+					if len(commands) == 0 {
+						plan.record(curChain)
+					} else {
+						plan.expected = projectPatch(curChain, commands)
+						observations = append(observations, plan)
+					}
+				}
+				if plan.rule != "" {
+					if readback == nil {
+						readback = make(map[chainLocation]patchRecovery)
+					}
+					readback[chainLocation{tableName, chainName}] = plan
+				}
+			} else {
+				commands, order, err = chain.Compile(chainNameBytes, curChain)
+				if err != nil {
+					return err
+				}
 			}
 			if len(commands) > 0 {
 				if !tableExists {
@@ -312,7 +339,7 @@ func (ipt *IPTables) CommitContext(ctx context.Context) (err error) {
 				buf.WriteByte(':')
 				buf.Write(chainNameBytes)
 				buf.WriteString(" - [0:0]\n")
-				commandsPrioritized[int8(priority)] = append(commandsPrioritized[int8(priority)], commands...)
+				commandsPrioritized[int8(order)] = append(commandsPrioritized[int8(order)], commands...)
 			}
 		}
 
@@ -373,5 +400,19 @@ func (ipt *IPTables) CommitContext(ctx context.Context) (err error) {
 		return nil
 	}
 
-	return ipt.executable.Restore(ctx, buf.Bytes())
+	ipt.pendingJumpChecks = readback
+	if err := ipt.executable.Restore(ctx, buf.Bytes()); err != nil {
+		return err
+	}
+	for _, plan := range observations {
+		plan.record(plan.expected)
+	}
+	if len(readback) == 0 {
+		return nil
+	}
+	applied, err := ipt.getCurrentRules(ctx)
+	if err != nil {
+		return fmt.Errorf("verify restored iptables jump: %w", err)
+	}
+	return ipt.checkJumpRecoveries(ctx, applied, true)
 }
