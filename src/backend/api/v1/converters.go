@@ -32,6 +32,35 @@ func detachedGroupFromReq(req types.GroupReq, existing *models.Group) (*models.G
 	return GroupFromReq(req, &group)
 }
 
+func groupMetadataOnly(req types.GroupReq, group *models.Group) bool {
+	if (req.ID != nil && *req.ID != group.ID) || req.Interface != group.Interface ||
+		(req.Enable == nil || *req.Enable) != group.Enable {
+		return false
+	}
+	if req.Rules == nil {
+		return true
+	}
+	if len(*req.Rules) != len(group.Rules) {
+		return false
+	}
+	for i, rule := range *req.Rules {
+		old := group.Rules[i]
+		if rule.ID == nil || *rule.ID != old.ID || rule.Name != old.Name ||
+			rule.Type != old.Type || rule.Rule != old.Rule || rule.Enable != old.Enable {
+			return false
+		}
+	}
+	return true
+}
+
+func applyGroupMetadata(req types.GroupReq, group *models.Group) {
+	group.Name = req.Name
+	group.Color = "#ffffff"
+	if match, _ := colorRegExp.MatchString(req.Color); match {
+		group.Color = strings.ToLower(req.Color)
+	}
+}
+
 func GroupFromReq(req types.GroupReq, existing *models.Group) (*models.Group, error) {
 	var group *models.Group
 	if existing == nil {
@@ -47,11 +76,7 @@ func GroupFromReq(req types.GroupReq, existing *models.Group) (*models.Group, er
 			group.ID = *req.ID
 		}
 	}
-	group.Name = req.Name
-	group.Color = "#ffffff"
-	if match, _ := colorRegExp.MatchString(req.Color); match {
-		group.Color = strings.ToLower(req.Color)
-	}
+	applyGroupMetadata(req, group)
 	group.Interface = req.Interface
 	group.Enable = true
 	if req.Enable != nil {

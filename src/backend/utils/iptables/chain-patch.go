@@ -10,6 +10,9 @@ import (
 type chainPatch struct {
 	orderedRules []chainPatchRule
 	sync         sync.RWMutex
+	recoverOrder bool
+	revision     uint64
+	anchors      map[string]jumpAnchors
 }
 
 type chainPatchRule struct {
@@ -34,6 +37,10 @@ func (c *chainPatch) addRule(r chainPatchRule) error {
 	}
 
 	c.orderedRules = append(c.orderedRules[:shiftedIdx], r)
+	if c.recoverOrder {
+		c.revision++
+		c.anchors = nil
+	}
 	return nil
 }
 
@@ -41,7 +48,11 @@ func (c *chainPatch) Compile(chainName []byte, existedRules []Rule) ([]command, 
 	c.sync.RLock()
 	defer c.sync.RUnlock()
 
-	existedRulesMap := make(map[string]uint8)
+	return c.compile(chainName, existedRules), 0, nil
+}
+
+func (c *chainPatch) compile(chainName []byte, existedRules []Rule) []command {
+	existedRulesMap := make(map[string]int)
 
 	for _, r := range existedRules {
 		key := r.String()
@@ -77,7 +88,7 @@ func (c *chainPatch) Compile(chainName []byte, existedRules []Rule) ([]command, 
 			out = append(out, command{Option: optionDelete, Chain: chainName, Rule: r.Rule})
 		}
 	}
-	return out, 0, nil
+	return out
 }
 
 func (c *chainPatch) Append(rule Rule) error {
