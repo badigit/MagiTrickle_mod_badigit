@@ -559,6 +559,10 @@ func (h *Handler) PutGroup(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		model := groupWrapper.Model()
+		if req.ID != nil && *req.ID != model.ID {
+			status, errMsg = http.StatusBadRequest, "group ID mismatch"
+			return
+		}
 		if groupMetadataOnly(req, model) {
 			applyGroupMetadata(req, model)
 			resp = RespFromGroup(model, true)
