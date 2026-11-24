@@ -9,6 +9,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"os/signal"
 	"path"
@@ -98,10 +99,28 @@ func parseLogLevel() zerolog.Level {
 	return zerolog.InfoLevel
 }
 
-func main() {
-	// Настройка zerolog
-	consoleLogger := zerolog.ConsoleWriter{
-		Out:        os.Stderr,
+type consoleLogWriter struct {
+	stdout zerolog.ConsoleWriter
+	stderr zerolog.ConsoleWriter
+}
+
+func (w consoleLogWriter) Write(p []byte) (int, error) {
+	return w.stdout.Write(p)
+}
+
+func (w consoleLogWriter) WriteLevel(level zerolog.Level, p []byte) (int, error) {
+	// OpenWrt procd помечает все строки из stderr как ошибки syslog.
+	switch level {
+	case zerolog.ErrorLevel, zerolog.FatalLevel, zerolog.PanicLevel:
+		return w.stderr.Write(p)
+	default:
+		return w.Write(p)
+	}
+}
+
+func newConsoleLogWriter(stdout, stderr io.Writer) consoleLogWriter {
+	console := zerolog.ConsoleWriter{
+		Out:        stdout,
 		TimeFormat: "15:04:05",
 		FieldsOrder: []string{
 			"id", "net", "name", "client",
@@ -110,9 +129,15 @@ func main() {
 			"group", "groupId", "subnet",
 		},
 	}
+	errorConsole := console
+	errorConsole.Out = stderr
+	return consoleLogWriter{stdout: console, stderr: errorConsole}
+}
+
+func main() {
 	zerolog.SetGlobalLevel(parseLogLevel())
 
-	log.Logger = log.Output(consoleLogger)
+	log.Logger = log.Output(newConsoleLogWriter(os.Stdout, os.Stderr))
 	startLog := log.Info().Str("version", constant.Version)
 	if constant.BuildDate != "" {
 		startLog = startLog.Str("build", constant.BuildDate)
