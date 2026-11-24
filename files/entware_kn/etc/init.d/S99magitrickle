@@ -8,8 +8,8 @@ DESC="MagiTrickle Daemon"
 PATH=/opt/sbin:/opt/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 UPTIME_MAX_BORDER=300
 
-# Диагностический лог демона. По умолчанию stdout/stderr уходят в /dev/null:
-# zerolog пишет в stderr строку на каждый DNS-запрос, а на роутере флеш дорогой.
+# По умолчанию stdout/stderr уходят в /dev/null.
+# Запись каждого DNS-запроса увеличивает нагрузку на флеш-память.
 # Включить: touch /opt/var/lib/magitrickle/debug-log  (и перезапустить демон).
 # Уровень задаётся отдельно: ARGS="--log-level debug".
 DEBUG_LOG_FLAG=/opt/var/lib/magitrickle/debug-log
