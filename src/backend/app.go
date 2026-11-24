@@ -7,7 +7,6 @@ import (
 	"os"
 	"os/exec"
 	"slices"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -21,7 +20,6 @@ import (
 	"magitrickle/utils/recordsCache"
 	"magitrickle/utils/trie"
 
-	"github.com/IGLOU-EU/go-wildcard/v2"
 	"github.com/rs/zerolog/log"
 	"github.com/vishvananda/netlink"
 	"github.com/vishvananda/netlink/nl"
@@ -69,7 +67,8 @@ type App struct {
 
 	// cfgMu сериализует все мутации конфига (группы/правила/подписки) и
 	// защищает lock-free чтения датапаса. См. app_config_lock.go.
-	cfgMu sync.RWMutex
+	cfgMu        sync.RWMutex
+	configSaveMu sync.Mutex
 
 	clientRoutingMu sync.Mutex
 
@@ -118,7 +117,18 @@ type App struct {
 }
 
 // New создаёт новый экземпляр App
-func New() *App {
+func New() (*App, error) {
+	a := newApp()
+	if err := a.LoadConfig(); err != nil {
+		return nil, err
+	}
+	if err := a.LoadInterfaceConfig(); err != nil {
+		log.Error().Err(err).Msg("failed to load interface aliases")
+	}
+	return a, nil
+}
+
+func newApp() *App {
 	a := &App{
 		startedAt:        time.Now(),
 		config:           constant.DefaultAppConfig,
@@ -131,12 +141,6 @@ func New() *App {
 	a.subscriptionGroups.Store(&emptySubscriptionGroups)
 	emptySubscriptions := make([]*models.Subscription, 0)
 	a.subscriptions.Store(&emptySubscriptions)
-	if err := a.LoadConfig(); err != nil {
-		log.Error().Err(err).Msg("failed to load config file")
-	}
-	if err := a.LoadInterfaceConfig(); err != nil {
-		log.Error().Err(err).Msg("failed to load interface aliases")
-	}
 	a.domainTrie.Store(trie.New())
 	return a
 }
@@ -164,15 +168,14 @@ func (a *App) RebuildTrie() {
 			case models.RuleTypeDomain:
 				newTrie.Insert(rule.Rule, g, true)
 			case models.RuleTypeWildcard:
-				if strings.Contains(rule.Rule, "*") || strings.Contains(rule.Rule, "?") {
+				if models.WildcardHasGlob(rule.Rule) {
 					newWildcards = append(newWildcards, &WildcardRule{
 						Rule:  rule.Rule,
 						Group: g,
 					})
 				} else {
 					// wildcard without glob chars is effectively a namespace
-					cleanDomain := strings.TrimPrefix(rule.Rule, "*.")
-					newTrie.Insert(cleanDomain, g, false)
+					newTrie.Insert(rule.Rule, g, false)
 				}
 			case models.RuleTypeNamespace:
 				newTrie.Insert(rule.Rule, g, false)
@@ -227,7 +230,7 @@ func (a *App) searchDomainExplain(domain string) (*Group, string, bool) {
 	wRules := a.wildcardRules
 	a.wildcardRulesLocker.RUnlock()
 	for _, wr := range wRules {
-		if wildcard.Match(wr.Rule, domain) {
+		if models.MatchWildcardGlob(wr.Rule, domain) {
 			if wr.Group.Enabled() && wr.Group.Group.Enable {
 				return wr.Group, models.LookupWhyWildcard, true
 			}
@@ -265,7 +268,9 @@ func (a *App) SearchDomainVerdict(domain string) (app.Group, string, bool) {
 
 // Config возвращает конфигурацию
 func (a *App) Config() models.AppConfig {
-	return a.config
+	a.cfgMu.RLock()
+	defer a.cfgMu.RUnlock()
+	return a.configSnapshotLocked()
 }
 
 // Groups возвращает список групп
@@ -307,13 +312,8 @@ func (a *App) AddGroup(groupModel *models.Group) error {
 			return ErrGroupIDConflict
 		}
 	}
-	// Проверка уникальности rule.ID внутри группы.
-	dup := make(map[[4]byte]struct{})
-	for _, rule := range groupModel.Rules {
-		if _, exists := dup[rule.ID]; exists {
-			return ErrRuleIDConflict
-		}
-		dup[rule.ID] = struct{}{}
+	if err := validateRuleIDs(groupModel.Rules); err != nil {
+		return err
 	}
 
 	grp, err := NewGroup(groupModel, a)
@@ -362,7 +362,7 @@ func (a *App) ListInterfaces() ([]net.Interface, error) {
 		return nil, fmt.Errorf("failed to get interfaces: %w", err)
 	}
 
-	if a.config.ShowAllInterfaces {
+	if a.Config().ShowAllInterfaces {
 		return interfaces, nil
 	}
 

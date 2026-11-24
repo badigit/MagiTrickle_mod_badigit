@@ -6,6 +6,7 @@ import (
 	"net"
 	"time"
 
+	"magitrickle/models"
 	"magitrickle/utils/netfilterTools"
 
 	"github.com/miekg/dns"
@@ -53,9 +54,22 @@ func trimFQDN(name string) string {
 	return name
 }
 
+func (a *App) dnsConfig() models.AppConfigDNSProxy {
+	a.cfgMu.RLock()
+	defer a.cfgMu.RUnlock()
+	return a.config.DNSProxy
+}
+
+func (a *App) dnsAdditionalTTL() uint32 {
+	a.cfgMu.RLock()
+	defer a.cfgMu.RUnlock()
+	return a.config.Netfilter.IPSet.AdditionalTTL
+}
+
 func (a *App) startDNSListeners(ctx context.Context, errChan chan error) {
+	host := a.dnsConfig().Host
 	go func() {
-		addr, err := net.ResolveUDPAddr("udp", fmt.Sprintf("%s:%d", a.config.DNSProxy.Host.Address, a.config.DNSProxy.Host.Port))
+		addr, err := net.ResolveUDPAddr("udp", fmt.Sprintf("%s:%d", host.Address, host.Port))
 		if err != nil {
 			errChan <- fmt.Errorf("failed to resolve udp address: %v", err)
 			return
@@ -66,7 +80,7 @@ func (a *App) startDNSListeners(ctx context.Context, errChan chan error) {
 	}()
 
 	go func() {
-		addr, err := net.ResolveTCPAddr("tcp", fmt.Sprintf("%s:%d", a.config.DNSProxy.Host.Address, a.config.DNSProxy.Host.Port))
+		addr, err := net.ResolveTCPAddr("tcp", fmt.Sprintf("%s:%d", host.Address, host.Port))
 		if err != nil {
 			errChan <- fmt.Errorf("failed to resolve tcp address: %v", err)
 			return
@@ -104,7 +118,7 @@ func (a *App) dnsRequestHook(clientAddr net.Addr, reqMsg dns.Msg, network string
 		a.dnsCapture.Record(q.Name, clientAddrStr)
 	}
 
-	if a.config.DNSProxy.DisableFakePTR {
+	if a.dnsConfig().DisableFakePTR {
 		return nil, nil, nil
 	}
 
@@ -137,7 +151,8 @@ func (a *App) dnsResponseHook(clientAddr net.Addr, reqMsg dns.Msg, respMsg dns.M
 	// копии (capAnswersTTL копирует капаемые RR), не мутируя respMsg.Answer[i].
 	defer func() { a.handleMessage(respMsg, clientAddr, network) }()
 
-	dropAAAA := !a.config.DNSProxy.DisableDropAAAA
+	dnsConfig := a.dnsConfig()
+	dropAAAA := !dnsConfig.DisableDropAAAA
 	if dropAAAA {
 		// фильтрация записей AAAA (in-place на respMsg: handleMessage не должен
 		// класть AAAA в ipset при активном drop)
@@ -153,7 +168,7 @@ func (a *App) dnsResponseHook(clientAddr net.Addr, reqMsg dns.Msg, respMsg dns.M
 		respMsg.Answer = filteredAnswers
 	}
 
-	ttlCap := a.config.DNSProxy.ClientTTLCap
+	ttlCap := dnsConfig.ClientTTLCap
 
 	// Ничего менять в клиентском ответе не нужно — отдаём оригинальные байты.
 	// Капать имеет смысл только для success-ответов: у NXDOMAIN/negative
@@ -275,7 +290,7 @@ func (a *App) processARecord(aRecord dns.A, idStr, clientAddrStr, network string
 		Str("net", network).
 		Msg("processing A record")
 
-	ttlDuration := ipsetTTLFromRecord(aRecord.Hdr.Ttl, a.config.Netfilter.IPSet.AdditionalTTL)
+	ttlDuration := ipsetTTLFromRecord(aRecord.Hdr.Ttl, a.dnsAdditionalTTL())
 
 	a.recordsCache.AddAddress(domainName, aRecord.A, ttlDuration)
 
@@ -338,7 +353,7 @@ func (a *App) processAAAARecord(aaaaRecord dns.AAAA, idStr, clientAddrStr, netwo
 		Str("net", network).
 		Msg("processing AAAA record")
 
-	ttlDuration := ipsetTTLFromRecord(aaaaRecord.Hdr.Ttl, a.config.Netfilter.IPSet.AdditionalTTL)
+	ttlDuration := ipsetTTLFromRecord(aaaaRecord.Hdr.Ttl, a.dnsAdditionalTTL())
 
 	a.recordsCache.AddAddress(domainName, aaaaRecord.AAAA, ttlDuration)
 
@@ -389,7 +404,7 @@ func (a *App) processCNameRecord(cNameRecord dns.CNAME, idStr, clientAddrStr, ne
 		Str("net", network).
 		Msg("processing CNAME record")
 
-	ttlDuration := ipsetTTLFromRecord(cNameRecord.Hdr.Ttl, a.config.Netfilter.IPSet.AdditionalTTL)
+	ttlDuration := ipsetTTLFromRecord(cNameRecord.Hdr.Ttl, a.dnsAdditionalTTL())
 
 	a.recordsCache.AddAlias(domainName, targetName, ttlDuration)
 

@@ -235,7 +235,22 @@ func (nh *Helper) Batch(fn func() error) error {
 	return errors.Join(errs...)
 }
 
+// ValidatePrefixes rejects broad prefixes before startup cleanup matches resource names.
+func ValidatePrefixes(chainPrefix, ipsetPrefix string) error {
+	const minPrefixLen = 3
+	if len(chainPrefix) < minPrefixLen {
+		return fmt.Errorf("chain prefix %q is too short: at least %d characters required", chainPrefix, minPrefixLen)
+	}
+	if len(ipsetPrefix) < minPrefixLen {
+		return fmt.Errorf("ipset prefix %q is too short: at least %d characters required", ipsetPrefix, minPrefixLen)
+	}
+	return nil
+}
+
 func New(chainPrefix, ipsetPrefix string, disableIPv4, disableIPv6 bool, startIdx uint32) (*Helper, error) {
+	if err := ValidatePrefixes(chainPrefix, ipsetPrefix); err != nil {
+		return nil, err
+	}
 	var ipt4, ipt6 *iptables.IPTables
 
 	if !disableIPv4 {

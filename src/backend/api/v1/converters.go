@@ -13,6 +13,54 @@ import (
 
 var colorRegExp = regexp2.MustCompile(`^#[0-9a-f]{6}$`, regexp2.IgnoreCase)
 
+func detachedGroupFromReq(req types.GroupReq, existing *models.Group) (*models.Group, error) {
+	if req.Rules != nil {
+		seen := make(map[intID.ID]struct{}, len(*req.Rules))
+		for _, rule := range *req.Rules {
+			if rule.ID != nil {
+				if _, duplicate := seen[*rule.ID]; duplicate {
+					return nil, fmt.Errorf("duplicate rule id %s", rule.ID.String())
+				}
+				seen[*rule.ID] = struct{}{}
+			}
+		}
+	}
+	if existing == nil {
+		return GroupFromReq(req, nil)
+	}
+	group := *existing
+	return GroupFromReq(req, &group)
+}
+
+func groupMetadataOnly(req types.GroupReq, group *models.Group) bool {
+	if (req.ID != nil && *req.ID != group.ID) || req.Interface != group.Interface ||
+		(req.Enable == nil || *req.Enable) != group.Enable {
+		return false
+	}
+	if req.Rules == nil {
+		return true
+	}
+	if len(*req.Rules) != len(group.Rules) {
+		return false
+	}
+	for i, rule := range *req.Rules {
+		old := group.Rules[i]
+		if rule.ID == nil || *rule.ID != old.ID || rule.Name != old.Name ||
+			rule.Type != old.Type || rule.Rule != old.Rule || rule.Enable != old.Enable {
+			return false
+		}
+	}
+	return true
+}
+
+func applyGroupMetadata(req types.GroupReq, group *models.Group) {
+	group.Name = req.Name
+	group.Color = "#ffffff"
+	if match, _ := colorRegExp.MatchString(req.Color); match {
+		group.Color = strings.ToLower(req.Color)
+	}
+}
+
 func GroupFromReq(req types.GroupReq, existing *models.Group) (*models.Group, error) {
 	var group *models.Group
 	if existing == nil {
@@ -28,11 +76,7 @@ func GroupFromReq(req types.GroupReq, existing *models.Group) (*models.Group, er
 			group.ID = *req.ID
 		}
 	}
-	group.Name = req.Name
-	group.Color = "#ffffff"
-	if match, _ := colorRegExp.MatchString(req.Color); match {
-		group.Color = strings.ToLower(req.Color)
-	}
+	applyGroupMetadata(req, group)
 	group.Interface = req.Interface
 	group.Enable = true
 	if req.Enable != nil {
@@ -42,37 +86,32 @@ func GroupFromReq(req types.GroupReq, existing *models.Group) (*models.Group, er
 	if req.Rules != nil {
 		newRules := make([]*models.Rule, len(*req.Rules))
 		for i, ruleReq := range *req.Rules {
-			r, err := RuleFromReq(ruleReq, group.Rules)
-			if err != nil {
-				return nil, err
-			}
-			newRules[i] = r
+			newRules[i] = RuleFromReq(ruleReq, group.Rules)
 		}
 		group.Rules = newRules
 	}
 	return group, nil
 }
 
-func RuleFromReq(ruleReq types.RuleReq, existingRules []*models.Rule) (*models.Rule, error) {
-	var rule *models.Rule
+func RuleFromReq(ruleReq types.RuleReq, existingRules []*models.Rule) *models.Rule {
 	if ruleReq.ID != nil {
 		for _, r := range existingRules {
 			if r.ID == *ruleReq.ID {
-				rule = r
-				break
+				return newRuleFromReq(ruleReq, r.ID)
 			}
 		}
 	}
-	if rule == nil {
-		rule = &models.Rule{
-			ID: intID.RandomID(),
-		}
+	return newRuleFromReq(ruleReq, intID.RandomID())
+}
+
+func newRuleFromReq(req types.RuleReq, id intID.ID) *models.Rule {
+	return &models.Rule{
+		ID:     id,
+		Name:   req.Name,
+		Type:   req.Type,
+		Rule:   req.Rule,
+		Enable: req.Enable,
 	}
-	rule.Name = ruleReq.Name
-	rule.Type = ruleReq.Type
-	rule.Rule = ruleReq.Rule
-	rule.Enable = ruleReq.Enable
-	return rule, nil
 }
 
 func RespFromGroups(groups []*models.Group, withRules bool) types.GroupsRes {
@@ -149,11 +188,7 @@ func SubscriptionFromReq(req types.SubscriptionReq, existing *models.Subscriptio
 	if req.Rules != nil {
 		newRules := make([]*models.Rule, len(*req.Rules))
 		for i, ruleReq := range *req.Rules {
-			r, err := RuleFromReq(ruleReq, subscription.Rules)
-			if err != nil {
-				return nil, err
-			}
-			newRules[i] = r
+			newRules[i] = RuleFromReq(ruleReq, subscription.Rules)
 		}
 		subscription.Rules = newRules
 	}

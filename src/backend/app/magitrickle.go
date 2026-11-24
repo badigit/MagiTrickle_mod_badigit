@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"errors"
 	"net"
 	"time"
 
@@ -12,6 +13,8 @@ import (
 
 	"github.com/vishvananda/netlink"
 )
+
+var ErrInvalidGroups = errors.New("invalid group set")
 
 // CapturedDomain — захваченный домен с количеством запросов.
 type CapturedDomain struct {
@@ -73,6 +76,8 @@ type Main interface {
 	SetDirectPriority(mode string) error
 	ClearGroups()
 	AddGroup(groupModel *models.Group) error
+	// ReplaceGroups installs a complete user group set under WithConfigWrite.
+	ReplaceGroups(groupModels []*models.Group) error
 	RemoveGroupByIndex(idx int)
 	ListInterfaces() ([]net.Interface, error)
 	OutgoingLinkIndexes() map[int]bool

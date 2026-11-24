@@ -47,21 +47,22 @@ func (a *App) Warmup(ctx context.Context) (app.WarmupResult, error) {
 
 	// Адрес собственного DNS-прокси. Слушатель биндит [::]/0.0.0.0 — клиентим по
 	// loopback, чтобы не зависеть от внешних адресов интерфейсов.
-	host := a.config.DNSProxy.Host.Address
+	settings := a.dnsConfig()
+	host := settings.Host.Address
 	switch host {
 	case "", "[::]", "::", "0.0.0.0":
 		host = "127.0.0.1"
 	}
-	proxyAddr := net.JoinHostPort(host, strconv.Itoa(int(a.config.DNSProxy.Host.Port)))
+	proxyAddr := net.JoinHostPort(host, strconv.Itoa(int(settings.Host.Port)))
 
-	timeout := a.config.DNSProxy.Timeout
+	timeout := settings.Timeout
 	if timeout <= 0 {
 		timeout = 5 * time.Second
 	}
 
 	// AAAA имеет смысл переспрашивать только если они не дропаются (иначе в ipset
 	// не попадут всё равно).
-	askAAAA := a.config.DNSProxy.DisableDropAAAA
+	askAAAA := settings.DisableDropAAAA
 
 	var (
 		wg       sync.WaitGroup

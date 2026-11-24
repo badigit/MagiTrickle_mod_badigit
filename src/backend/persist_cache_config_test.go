@@ -19,7 +19,7 @@ func TestPersistCacheDefaultOff(t *testing.T) {
 // (нужно, чтобы пользователь мог осознанно включить фичу), а nil (ключ
 // отсутствует в файле) оставляет дефолт нетронутым.
 func TestImportConfigPersistCache(t *testing.T) {
-	a := New()
+	a := newApp()
 
 	// Явный true в конфиге включает фичу.
 	enable := true
@@ -54,7 +54,7 @@ func TestImportConfigPersistCache(t *testing.T) {
 // TestExportConfigRoundtripsPersistCache — ExportConfig отдаёт текущее значение,
 // а не дефолт, чтобы SaveConfig не потерял осознанный выбор пользователя.
 func TestExportConfigRoundtripsPersistCache(t *testing.T) {
-	a := New()
+	a := newApp()
 	a.config.DNSProxy.PersistCache = true
 
 	exported := a.ExportConfig()

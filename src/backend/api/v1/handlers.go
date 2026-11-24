@@ -1,6 +1,7 @@
 package v1
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -377,54 +378,67 @@ func (h *Handler) PutGroups(w http.ResponseWriter, r *http.Request) {
 		utils.WriteError(w, http.StatusBadRequest, "no groups in request")
 		return
 	}
-	var buildErr error
-	var addErrors []string
+	var applyErr error
 	var resp types.GroupsRes
 	h.app.WithConfigWrite(func() {
-		for _, g := range h.app.Groups() {
-			_ = g.Disable()
+		groups := h.app.Groups()
+		if len(groups) == len(*req.Groups) {
+			metadataOnly := true
+			for i, groupReq := range *req.Groups {
+				old := groups[i].Model()
+				if groupReq.ID == nil || *groupReq.ID != old.ID || !groupMetadataOnly(groupReq, old) {
+					metadataOnly = false
+					break
+				}
+			}
+			if metadataOnly {
+				updated := make([]*models.Group, len(groups))
+				for i, groupReq := range *req.Groups {
+					updated[i] = groups[i].Model()
+					applyGroupMetadata(groupReq, updated[i])
+				}
+				resp = RespFromGroups(updated, true)
+				return
+			}
+		}
+		existingGroups := make(map[intID.ID]*models.Group, len(groups))
+		for _, g := range groups {
+			existingGroups[g.Model().ID] = g.Model()
 		}
 		newGroups := make([]*models.Group, len(*req.Groups))
 		for i, gReq := range *req.Groups {
 			var existing *models.Group
-			for _, g := range h.app.Groups() {
-				if gReq.ID != nil && g.Model().ID == *gReq.ID {
-					existing = g.Model()
-					break
-				}
+			if gReq.ID != nil {
+				existing = existingGroups[*gReq.ID]
 			}
-			newGroups[i], buildErr = GroupFromReq(gReq, existing)
-			if buildErr != nil {
+			group, err := detachedGroupFromReq(gReq, existing)
+			if err != nil {
+				applyErr = fmt.Errorf("%w: %w", app.ErrInvalidGroups, err)
 				return
 			}
+			newGroups[i] = group
 		}
-		h.app.ClearGroups()
-		for _, grp := range newGroups {
-			if err := h.app.AddGroup(grp); err != nil {
-				log.Error().Err(err).Str("group", grp.Name).Msg("failed to add group")
-				addErrors = append(addErrors, fmt.Sprintf("%s: %v", grp.Name, err))
-			}
+		applyErr = h.app.ReplaceGroups(newGroups)
+		if applyErr == nil {
+			resp = RespFromGroups(newGroups, true)
 		}
-		h.app.SyncAllGroups()
-		resp = RespFromGroups(newGroups, true)
 	})
-	if buildErr != nil {
-		utils.WriteError(w, http.StatusBadRequest, buildErr.Error())
+	if applyErr != nil {
+		status := http.StatusInternalServerError
+		if errors.Is(applyErr, app.ErrInvalidGroups) {
+			status = http.StatusBadRequest
+		}
+		utils.WriteError(w, status, applyErr.Error())
 		return
-	}
-	if len(addErrors) > 0 {
-		utils.WriteJson(w, http.StatusOK, map[string]any{
-			"groups": resp.Groups,
-			"errors": addErrors,
-		})
-	} else {
-		utils.WriteJson(w, http.StatusOK, resp)
 	}
 	if r.URL.Query().Get("save") == "true" {
 		if err := h.app.SaveConfig(); err != nil {
 			log.Error().Err(err).Msg("failed to save config file")
+			utils.WriteError(w, http.StatusInternalServerError, "groups applied in memory, but failed to save config")
+			return
 		}
 	}
+	utils.WriteJson(w, http.StatusOK, resp)
 }
 
 // CreateGroup
@@ -542,6 +556,16 @@ func (h *Handler) PutGroup(w http.ResponseWriter, r *http.Request) {
 		groupWrapper, ok := h.app.GroupByID(groupID)
 		if !ok {
 			status, errMsg = http.StatusNotFound, "group not exist"
+			return
+		}
+		model := groupWrapper.Model()
+		if req.ID != nil && *req.ID != model.ID {
+			status, errMsg = http.StatusBadRequest, "group ID mismatch"
+			return
+		}
+		if groupMetadataOnly(req, model) {
+			applyGroupMetadata(req, model)
+			resp = RespFromGroup(model, true)
 			return
 		}
 		enabled := groupWrapper.Enabled()
@@ -792,11 +816,7 @@ func (h *Handler) CreateRule(w http.ResponseWriter, r *http.Request) {
 		}
 		enabled := groupWrapper.Enabled()
 
-		rule, e := RuleFromReq(req, groupWrapper.Model().Rules)
-		if e != nil {
-			status, errMsg = http.StatusBadRequest, e.Error()
-			return
-		}
+		rule := newRuleFromReq(req, intID.RandomID())
 		groupWrapper.Model().Rules = append(groupWrapper.Model().Rules, rule)
 		if enabled {
 			h.app.SyncAllGroups()
@@ -902,25 +922,20 @@ func (h *Handler) PutRule(w http.ResponseWriter, r *http.Request) {
 			status, errMsg = http.StatusNotFound, "group not exist"
 			return
 		}
-		var rule *models.Rule
-		for _, rl := range groupWrapper.Model().Rules {
-			if rl.ID == ruleID {
-				rule = rl
-				break
+		group := groupWrapper.Model()
+		for i, rule := range group.Rules {
+			if rule.ID != ruleID {
+				continue
 			}
-		}
-		if rule == nil {
-			status, errMsg = http.StatusNotFound, "rule not exist"
+			replacement := newRuleFromReq(req, ruleID)
+			group.Rules[i] = replacement
+			if groupWrapper.Enabled() {
+				h.app.SyncAllGroups()
+			}
+			resp = RespFromRule(replacement)
 			return
 		}
-		rule.Name = req.Name
-		rule.Type = req.Type
-		rule.Rule = req.Rule
-		rule.Enable = req.Enable
-		if groupWrapper.Enabled() {
-			h.app.SyncAllGroups()
-		}
-		resp = RespFromRule(rule)
+		status, errMsg = http.StatusNotFound, "rule not exist"
 	})
 	if status != 0 {
 		utils.WriteError(w, status, errMsg)

@@ -53,30 +53,15 @@ func (a *App) RebuildSubscriptionGroups() error {
 }
 
 func (a *App) rebuildSubscriptionGroupsLocked() error {
+	newGroups, err := a.prepareSubscriptionGroups(a.Subscriptions())
+	if err != nil {
+		return err
+	}
 	oldGroups := *a.subscriptionGroups.Load()
 	if a.routingActive.Load() {
 		for _, group := range oldGroups {
 			_ = group.Disable()
 		}
-	}
-
-	subscriptions := a.Subscriptions()
-	newGroups := make([]*Group, 0, len(subscriptions))
-	for _, subscription := range subscriptions {
-		groupModel := &models.Group{
-			ID:        subscription.ID,
-			Name:      subscription.Name,
-			Color:     subscriptionRuntimeGroupColor,
-			Interface: subscription.Interface,
-			Enable:    subscription.Enable,
-			Rules:     subscription.Rules,
-		}
-
-		group, err := newGroupWithRuntimeID(groupModel, a, "s"+subscription.ID.String())
-		if err != nil {
-			return fmt.Errorf("failed to create runtime subscription group: %w", err)
-		}
-		newGroups = append(newGroups, group)
 	}
 
 	a.subscriptionGroups.Store(&newGroups)
@@ -93,6 +78,27 @@ func (a *App) rebuildSubscriptionGroupsLocked() error {
 
 	a.SyncAllGroups()
 	return nil
+}
+
+func (a *App) prepareSubscriptionGroups(subscriptions []*models.Subscription) ([]*Group, error) {
+	groups := make([]*Group, 0, len(subscriptions))
+	for _, subscription := range subscriptions {
+		groupModel := &models.Group{
+			ID:        subscription.ID,
+			Name:      subscription.Name,
+			Color:     subscriptionRuntimeGroupColor,
+			Interface: subscription.Interface,
+			Enable:    subscription.Enable,
+			Rules:     subscription.Rules,
+		}
+
+		group, err := newGroupWithRuntimeID(groupModel, a, "s"+subscription.ID.String())
+		if err != nil {
+			return nil, fmt.Errorf("failed to create runtime subscription group: %w", err)
+		}
+		groups = append(groups, group)
+	}
+	return groups, nil
 }
 
 // rulesEquivalent reports whether two rule lists describe the same set of
